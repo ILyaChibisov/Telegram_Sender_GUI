@@ -36,7 +36,8 @@ class SettingsManager:
             'daily_limit': 10,
             'min_delay': 3600,
             'max_delay': 5400,
-            'bot_token': BOT_TOKEN
+            'bot_token': BOT_TOKEN,
+            'parse_mode': 'HTML'
         }
 
         if os.path.exists(SETTINGS_FILE):
@@ -204,13 +205,14 @@ class BotSendThread(QThread):
     finished = pyqtSignal(str)
     error = pyqtSignal(str)
 
-    def __init__(self, user_ids, message, image_path=None, video_path=None, bot_token=None):
+    def __init__(self, user_ids, message, image_path=None, video_path=None, bot_token=None, parse_mode='HTML'):
         super().__init__()
         self.user_ids = user_ids
         self.message = message
         self.image_path = image_path
         self.video_path = video_path
         self.bot_token = bot_token
+        self.parse_mode = parse_mode
         self.is_running = True
 
     def stop_sending(self):
@@ -268,36 +270,46 @@ class BotSendThread(QThread):
     async def send_to_user(self, user_id):
         """Отправка одного сообщения пользователю через бота"""
         import aiohttp
-        import base64
+        from aiohttp import FormData
 
         try:
             url = f"https://api.telegram.org/bot{self.bot_token}/"
 
             # Если есть изображение
             if self.image_path and os.path.exists(self.image_path):
+                form_data = FormData()
+                form_data.add_field('chat_id', str(user_id))
+
                 with open(self.image_path, 'rb') as img_file:
-                    files = {'photo': img_file}
-                    data = {'chat_id': user_id}
+                    form_data.add_field('photo', img_file.read(), filename=os.path.basename(self.image_path))
 
-                    if self.message:
-                        data['caption'] = self.message
+                if self.message:
+                    form_data.add_field('caption', self.message)
+                    if self.parse_mode:
+                        form_data.add_field('parse_mode', self.parse_mode)
 
-                    async with aiohttp.ClientSession() as session:
-                        async with session.post(url + 'sendPhoto', data=data, files=files) as response:
-                            return response.status == 200
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(url + 'sendPhoto', data=form_data) as response:
+                        result = await response.json()
+                        return result.get('ok', False)
 
             # Если есть видео
             elif self.video_path and os.path.exists(self.video_path):
+                form_data = FormData()
+                form_data.add_field('chat_id', str(user_id))
+
                 with open(self.video_path, 'rb') as vid_file:
-                    files = {'video': vid_file}
-                    data = {'chat_id': user_id}
+                    form_data.add_field('video', vid_file.read(), filename=os.path.basename(self.video_path))
 
-                    if self.message:
-                        data['caption'] = self.message
+                if self.message:
+                    form_data.add_field('caption', self.message)
+                    if self.parse_mode:
+                        form_data.add_field('parse_mode', self.parse_mode)
 
-                    async with aiohttp.ClientSession() as session:
-                        async with session.post(url + 'sendVideo', data=data, files=files) as response:
-                            return response.status == 200
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(url + 'sendVideo', data=form_data) as response:
+                        result = await response.json()
+                        return result.get('ok', False)
 
             # Если только текст
             elif self.message:
@@ -306,9 +318,13 @@ class BotSendThread(QThread):
                     'text': self.message
                 }
 
+                if self.parse_mode:
+                    data['parse_mode'] = self.parse_mode
+
                 async with aiohttp.ClientSession() as session:
                     async with session.post(url + 'sendMessage', json=data) as response:
-                        return response.status == 200
+                        result = await response.json()
+                        return result.get('ok', False)
 
             return False
 
@@ -456,7 +472,7 @@ class BotSettingsDialog(QDialog):
 
     def init_ui(self):
         self.setWindowTitle('Настройки бота')
-        self.setFixedSize(500, 400)
+        self.setFixedSize(500, 450)
         layout = QVBoxLayout()
 
         # Токен бота
@@ -484,7 +500,32 @@ class BotSettingsDialog(QDialog):
         self.max_delay_spin.setValue(self.settings.get('max_delay', 5400))
         layout.addWidget(self.max_delay_spin)
 
-        # Инструкция
+        # Настройки форматирования
+        layout.addWidget(QLabel('Форматирование текста:'))
+        self.parse_mode_combo = QComboBox()
+        self.parse_mode_combo.addItem('HTML', 'HTML')
+        self.parse_mode_combo.addItem('Markdown', 'Markdown')
+        self.parse_mode_combo.addItem('MarkdownV2', 'MarkdownV2')
+        self.parse_mode_combo.addItem('Без форматирования', 'None')
+
+        current_mode = self.settings.get('parse_mode', 'HTML')
+        index = self.parse_mode_combo.findData(current_mode)
+        if index >= 0:
+            self.parse_mode_combo.setCurrentIndex(index)
+        layout.addWidget(self.parse_mode_combo)
+
+        # Инструкция по форматированию
+        format_info = QLabel(
+            'Поддерживаемое форматирование:\n'
+            '• HTML: <b>жирный</b>, <i>курсив</i>, <u>подчеркивание</u>\n'
+            '• Markdown: *жирный*, _курсив_, `код`\n'
+            '• MarkdownV2: *жирный*, _курсив_, __подчеркнутый__'
+        )
+        format_info.setStyleSheet('color: gray; font-size: 10px; background-color: #f5f5f5; padding: 5px;')
+        format_info.setWordWrap(True)
+        layout.addWidget(format_info)
+
+        # Инструкция по получению токена
         info_label = QLabel(
             'Как получить токен бота:\n'
             '1. Найти @BotFather в Telegram\n'
@@ -522,11 +563,94 @@ class BotSettingsDialog(QDialog):
         self.settings['min_delay'] = self.min_delay_spin.value()
         self.settings['max_delay'] = self.max_delay_spin.value()
 
+        parse_mode = self.parse_mode_combo.currentData()
+        if parse_mode == 'None':
+            parse_mode = None
+        self.settings['parse_mode'] = parse_mode
+
         if SettingsManager.save_settings(self.settings):
             QMessageBox.information(self, 'Успех', 'Настройки сохранены!')
             self.accept()
         else:
             QMessageBox.warning(self, 'Ошибка', 'Не удалось сохранить настройки')
+
+
+class MarkdownHelperDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.init_ui()
+
+    def init_ui(self):
+        self.setWindowTitle('Помощник по форматированию')
+        self.setFixedSize(500, 400)
+        layout = QVBoxLayout()
+
+        # HTML форматирование
+        html_group = QGroupBox('HTML форматирование')
+        html_layout = QVBoxLayout()
+
+        html_examples = [
+            ('Жирный текст', '<b>жирный текст</b>'),
+            ('Курсив', '<i>курсив</i>'),
+            ('Подчеркивание', '<u>подчеркивание</u>'),
+            ('Зачеркивание', '<s>зачеркивание</s>'),
+            ('Ссылка', '<a href="https://example.com">текст ссылки</a>'),
+            ('Моноширинный', '<code>моноширинный</code>'),
+            ('Преформатированный', '<pre>преформатированный</pre>')
+        ]
+
+        for desc, example in html_examples:
+            example_layout = QHBoxLayout()
+            example_layout.addWidget(QLabel(f"{desc}:"))
+            example_edit = QLineEdit(example)
+            example_edit.setReadOnly(True)
+            example_edit.setStyleSheet('background-color: #f0f0f0;')
+            copy_btn = QPushButton('Копировать')
+            copy_btn.clicked.connect(lambda checked, text=example: self.copy_to_clipboard(text))
+            example_layout.addWidget(example_edit)
+            example_layout.addWidget(copy_btn)
+            html_layout.addLayout(example_layout)
+
+        html_group.setLayout(html_layout)
+        layout.addWidget(html_group)
+
+        # Markdown форматирование
+        md_group = QGroupBox('Markdown форматирование')
+        md_layout = QVBoxLayout()
+
+        md_examples = [
+            ('Жирный текст', '*жирный текст*'),
+            ('Курсив', '_курсив_'),
+            ('Моноширинный', '`моноширинный`'),
+            ('Ссылка', '[текст ссылки](https://example.com)')
+        ]
+
+        for desc, example in md_examples:
+            example_layout = QHBoxLayout()
+            example_layout.addWidget(QLabel(f"{desc}:"))
+            example_edit = QLineEdit(example)
+            example_edit.setReadOnly(True)
+            example_edit.setStyleSheet('background-color: #f0f0f0;')
+            copy_btn = QPushButton('Копировать')
+            copy_btn.clicked.connect(lambda checked, text=example: self.copy_to_clipboard(text))
+            example_layout.addWidget(example_edit)
+            example_layout.addWidget(copy_btn)
+            md_layout.addLayout(example_layout)
+
+        md_group.setLayout(md_layout)
+        layout.addWidget(md_group)
+
+        # Кнопка закрытия
+        close_btn = QPushButton('Закрыть')
+        close_btn.clicked.connect(self.accept)
+        layout.addWidget(close_btn)
+
+        self.setLayout(layout)
+
+    def copy_to_clipboard(self, text):
+        clipboard = QApplication.clipboard()
+        clipboard.setText(text)
+        QMessageBox.information(self, 'Успех', 'Текст скопирован в буфер обмена')
 
 
 class TelegramBotApp(QMainWindow):
@@ -554,10 +678,25 @@ class TelegramBotApp(QMainWindow):
         send_layout = QVBoxLayout()
 
         # Сообщение
-        send_layout.addWidget(QLabel('Текст сообщения:'))
+        message_layout = QHBoxLayout()
+        message_layout.addWidget(QLabel('Текст сообщения:'))
+
+        self.format_help_btn = QPushButton('❓ Помощник по форматированию')
+        self.format_help_btn.setStyleSheet('background-color: #FF9800; color: white; padding: 4px;')
+        self.format_help_btn.clicked.connect(self.show_format_help)
+        message_layout.addWidget(self.format_help_btn)
+
+        send_layout.addLayout(message_layout)
+
         self.message_text = QTextEdit()
         self.message_text.setMinimumHeight(100)
-        self.message_text.setPlaceholderText('Введите текст сообщения...')
+        self.message_text.setPlaceholderText(
+            'Введите текст сообщения...\n\n'
+            'Примеры форматирования:\n'
+            'HTML: <b>жирный</b> <i>курсив</i> <u>подчеркивание</u>\n'
+            'Markdown: *жирный* _курсив_ `код`\n'
+            'MarkdownV2: *жирный* _курсив_ __подчеркнутый__'
+        )
         send_layout.addWidget(self.message_text)
 
         # Медиа файлы
@@ -660,11 +799,21 @@ class TelegramBotApp(QMainWindow):
         self.status_label.setStyleSheet('color: green;')
         layout.addWidget(self.status_label)
 
-        # Кнопка настроек
+        # Кнопки управления
+        buttons_layout = QHBoxLayout()
+
         self.settings_btn = QPushButton('⚙️ Настройки бота')
         self.settings_btn.setStyleSheet('background-color: #795548; color: white; font-weight: bold; padding: 8px;')
         self.settings_btn.clicked.connect(self.show_settings)
-        layout.addWidget(self.settings_btn)
+        buttons_layout.addWidget(self.settings_btn)
+
+        self.format_help_main_btn = QPushButton('📝 Помощник по форматированию')
+        self.format_help_main_btn.setStyleSheet(
+            'background-color: #607D8B; color: white; font-weight: bold; padding: 8px;')
+        self.format_help_main_btn.clicked.connect(self.show_format_help)
+        buttons_layout.addWidget(self.format_help_main_btn)
+
+        layout.addLayout(buttons_layout)
 
         central_widget.setLayout(layout)
         self.setCentralWidget(central_widget)
@@ -675,6 +824,11 @@ class TelegramBotApp(QMainWindow):
         self.timer.start(5000)
 
         self.update_status()
+
+    def show_format_help(self):
+        """Показывает диалог помощи по форматированию"""
+        dialog = MarkdownHelperDialog(self)
+        dialog.exec_()
 
     def select_image(self):
         """Выбор изображения"""
@@ -757,12 +911,17 @@ class TelegramBotApp(QMainWindow):
         self.set_buttons_enabled(False)
         self.stop_send_btn.setEnabled(True)
 
+        parse_mode = self.settings.get('parse_mode', 'HTML')
+        if parse_mode == 'None':
+            parse_mode = None
+
         self.send_thread = BotSendThread(
             user_ids,
             message,
             self.current_image_path,
             self.current_video_path,
-            self.settings['bot_token']
+            self.settings['bot_token'],
+            parse_mode
         )
         self.send_thread.progress.connect(self.on_send_progress)
         self.send_thread.finished.connect(self.on_send_finished)
@@ -805,6 +964,8 @@ class TelegramBotApp(QMainWindow):
         self.send_selected_btn.setEnabled(enabled)
         self.send_unsent_btn.setEnabled(enabled)
         self.settings_btn.setEnabled(enabled)
+        self.format_help_main_btn.setEnabled(enabled)
+        self.format_help_btn.setEnabled(enabled)
 
     def add_user_dialog(self):
         """Диалог добавления пользователя"""
@@ -901,80 +1062,65 @@ class TelegramBotApp(QMainWindow):
                                         else:
                                             username = username_part
 
-                                        # Извлекаем ID
-                                        if id_part.isdigit():
-                                            user_id = id_part
+                                        user_id = id_part
 
                             except Exception as e:
-                                print(f"Ошибка разбора строки {line_num}: {e}")
+                                print(f"Ошибка парсинга строки {line_num}: {e}")
 
-                        # Если не получилось, пробуем старый формат JSON
-                        if not user_id:
-                            try:
-                                user_data = json.loads(line)
-                                user_id = user_data.get('user_id')
-                                if user_id:
-                                    username = user_data.get('username', '')
-                            except json.JSONDecodeError:
-                                # Пробуем простой формат: "user_id,username"
-                                parts = line.split(',')
-                                if len(parts) >= 1:
-                                    user_id = parts[0].strip()
-                                    if len(parts) > 1:
-                                        username = parts[1].strip()
-                                        if username.startswith('@'):
-                                            username = username[1:]
-
-                        # Добавляем пользователя если нашли ID
-                        if user_id and user_id.isdigit():
-                            UserManager.add_user(user_id, username)
-                            imported_count += 1
+                        # Формат: "1128498988" или "@username"
+                        elif line.isdigit():
+                            user_id = line
+                        elif line.startswith('@'):
+                            username = line[1:]
+                            # Нужно будет получить ID позже
                         else:
-                            skipped_count += 1
-                            print(f"Пропущена строка {line_num}: {line}")
+                            # Пробуем как чистый ID
+                            if line.isdigit():
+                                user_id = line
+                            else:
+                                username = line
+
+                        if user_id:
+                            if UserManager.add_user(user_id, username):
+                                imported_count += 1
+                            else:
+                                skipped_count += 1
 
                 self.refresh_users_list()
-
-                message = f'Импортировано пользователей: {imported_count}'
-                if skipped_count > 0:
-                    message += f'\nПропущено строк: {skipped_count}'
-
-                QMessageBox.information(self, 'Результат импорта', message)
+                QMessageBox.information(
+                    self, 'Импорт завершен',
+                    f'Успешно импортировано: {imported_count}\nПропущено: {skipped_count}'
+                )
 
             except Exception as e:
                 QMessageBox.critical(self, 'Ошибка', f'Ошибка импорта: {str(e)}')
 
     def bulk_import_dialog(self):
-        """Диалог для массового импорта пользователей"""
+        """Диалог массового импорта"""
         dialog = QDialog(self)
         dialog.setWindowTitle('Массовый импорт пользователей')
         dialog.setFixedSize(500, 400)
         layout = QVBoxLayout()
 
-        instruction = QLabel(
-            'Введите пользователей в формате:\n'
-            '1. @username,user_id\n'
-            '2. @username,user_id\n'
-            'или просто:\n'
-            '@username,user_id\n'
-            'username,user_id\n'
-            'user_id'
-        )
-        layout.addWidget(instruction)
+        layout.addWidget(QLabel('Введите данные пользователей (каждый с новой строки):'))
+        layout.addWidget(QLabel('Форматы: ID, @username, или ID,username'))
 
         text_edit = QTextEdit()
-        text_edit.setPlaceholderText('Введите данные пользователей...')
+        text_edit.setPlaceholderText(
+            'Примеры:\n'
+            '123456789\n'
+            '@username\n'
+            '123456789,username\n'
+            '123456789,@username'
+        )
         layout.addWidget(text_edit)
 
         button_layout = QHBoxLayout()
-
         import_btn = QPushButton('Импортировать')
-        import_btn.setStyleSheet('background-color: #4CAF50; color: white;')
         import_btn.clicked.connect(lambda: self.bulk_import(text_edit.toPlainText(), dialog))
         button_layout.addWidget(import_btn)
 
         cancel_btn = QPushButton('Отмена')
-        cancel_btn.setStyleSheet('background-color: #f44336; color: white;')
         cancel_btn.clicked.connect(dialog.reject)
         button_layout.addWidget(cancel_btn)
 
@@ -983,9 +1129,10 @@ class TelegramBotApp(QMainWindow):
         dialog.exec_()
 
     def bulk_import(self, text, dialog):
-        """Массовый импорт из текста"""
-        lines = text.split('\n')
+        """Массовый импорт пользователей"""
+        lines = text.strip().split('\n')
         imported_count = 0
+        skipped_count = 0
 
         for line in lines:
             line = line.strip()
@@ -995,108 +1142,54 @@ class TelegramBotApp(QMainWindow):
             user_id = None
             username = ''
 
-            # Формат: "1. @username,user_id"
-            if '.' in line and '@' in line and ',' in line:
-                parts = line.split('.', 1)
-                if len(parts) > 1:
-                    rest = parts[1].strip()
-                    last_comma = rest.rfind(',')
-                    if last_comma != -1:
-                        username_part = rest[:last_comma].strip()
-                        id_part = rest[last_comma + 1:].strip()
-
-                        if username_part.startswith('@'):
-                            username = username_part[1:]
-                        else:
-                            username = username_part
-
-                        if id_part.isdigit():
-                            user_id = id_part
-
-            # Формат: "@username,user_id"
-            elif '@' in line and ',' in line:
-                parts = line.split(',')
-                if len(parts) >= 2:
-                    username_part = parts[0].strip()
-                    id_part = parts[1].strip()
-
-                    if username_part.startswith('@'):
-                        username = username_part[1:]
-                    else:
-                        username = username_part
-
-                    if id_part.isdigit():
-                        user_id = id_part
-
-            # Формат: "user_id" или "username,user_id"
-            elif ',' in line:
-                parts = line.split(',')
-                if len(parts) >= 2:
-                    username_part = parts[0].strip()
-                    id_part = parts[1].strip()
-
-                    if username_part.startswith('@'):
-                        username = username_part[1:]
-                    else:
-                        username = username_part
-
-                    if id_part.isdigit():
-                        user_id = id_part
-                else:
-                    # Только user_id
-                    if line.isdigit():
-                        user_id = line
-
-            # Просто user_id
+            if ',' in line:
+                parts = line.split(',', 1)
+                user_id = parts[0].strip()
+                username = parts[1].strip()
+                if username.startswith('@'):
+                    username = username[1:]
+            elif line.startswith('@'):
+                username = line[1:]
             elif line.isdigit():
                 user_id = line
+            else:
+                # Пробуем как username без @
+                username = line
 
-            if user_id:
-                UserManager.add_user(user_id, username)
-                imported_count += 1
+            if user_id or username:
+                if UserManager.add_user(user_id or '', username):
+                    imported_count += 1
+                else:
+                    skipped_count += 1
 
         dialog.accept()
         self.refresh_users_list()
-        QMessageBox.information(self, 'Успех', f'Импортировано пользователей: {imported_count}')
+        QMessageBox.information(
+            self, 'Импорт завершен',
+            f'Успешно импортировано: {imported_count}\nПропущено: {skipped_count}'
+        )
 
     def export_users(self):
-        """Экспорт пользователей в файл с вашим форматом"""
+        """Экспорт пользователей в файл"""
         file_path, _ = QFileDialog.getSaveFileName(
-            self, 'Сохранить пользователей', 'users_export.txt',
-            'Text files (*.txt);;JSON files (*.json)'
+            self, 'Сохранить список пользователей', 'users_export.txt',
+            'Text files (*.txt);;All files (*.*)'
         )
         if file_path:
+            users = UserManager.load_users()
             try:
-                users = UserManager.load_users()
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    for user_id, data in users.items():
+                        username = data.get('username', '')
+                        first_name = data.get('first_name', '')
+                        last_name = data.get('last_name', '')
+                        status = data.get('status', 'не отправлено')
+                        send_time = data.get('send_time', '')
 
-                # Определяем формат по расширению
-                if file_path.endswith('.json'):
-                    # JSON формат
-                    with open(file_path, 'w', encoding='utf-8') as f:
-                        for user_id, data in users.items():
-                            user_data = {
-                                'user_id': user_id,
-                                'username': data.get('username', ''),
-                                'first_name': data.get('first_name', ''),
-                                'last_name': data.get('last_name', ''),
-                                'status': data.get('status', 'не отправлено'),
-                                'send_time': data.get('send_time', '')
-                            }
-                            f.write(json.dumps(user_data, ensure_ascii=False) + '\n')
-                else:
-                    # Текстовый формат: "1. @username,user_id"
-                    with open(file_path, 'w', encoding='utf-8') as f:
-                        for i, (user_id, data) in enumerate(users.items(), 1):
-                            username = data.get('username', '')
-                            if username:
-                                username_display = f"@{username}"
-                            else:
-                                username_display = "NoUsername"
+                        line = f"{user_id},{username},{first_name},{last_name},{status},{send_time}\n"
+                        f.write(line)
 
-                            f.write(f"{i}. {username_display},{user_id}\n")
-
-                QMessageBox.information(self, 'Успех', f'Пользователи экспортированы: {len(users)}')
-
+                QMessageBox.information(self, 'Успех', f'Пользователи экспортированы в {file_path}')
             except Exception as e:
                 QMessageBox.critical(self, 'Ошибка', f'Ошибка экспорта: {str(e)}')
 
@@ -1104,6 +1197,9 @@ class TelegramBotApp(QMainWindow):
         """Обновление списка пользователей"""
         self.users_list.clear()
         users = UserManager.load_users()
+
+        sent_count = 0
+        unsent_count = 0
 
         for user_id, data in users.items():
             username = data.get('username', '')
@@ -1123,18 +1219,20 @@ class TelegramBotApp(QMainWindow):
 
             item = QListWidgetItem(display_text)
 
-            # Цвет в зависимости от статуса
             if status == 'отправлено':
                 item.setForeground(Qt.darkGreen)
-            elif status == 'ошибка':
-                item.setForeground(Qt.red)
+                sent_count += 1
             else:
-                item.setForeground(Qt.darkGray)
+                item.setForeground(Qt.darkRed)
+                unsent_count += 1
 
             self.users_list.addItem(item)
 
+        # Обновляем заголовок вкладки
+        self.tabs.setTabText(1, f'👥 Пользователи ({sent_count}/{unsent_count})')
+
     def show_settings(self):
-        """Показ настроек"""
+        """Показ диалога настроек"""
         dialog = BotSettingsDialog(self)
         if dialog.exec_() == QDialog.Accepted:
             self.settings = SettingsManager.load_settings()
@@ -1143,19 +1241,17 @@ class TelegramBotApp(QMainWindow):
     def update_status(self):
         """Обновление статуса"""
         total_users = len(UserManager.load_users())
-        unsent_count = len(UserManager.get_unsent_users())
+        unsent_users = len(UserManager.get_unsent_users())
         today_sent = UserManager.get_today_sent_count()
         daily_limit = self.settings.get('daily_limit', 10)
 
-        status_text = f"👥 Всего пользователей: {total_users} | "
-        status_text += f"📨 Неотправленных: {unsent_count} | "
-        status_text += f"📊 Отправлено сегодня: {today_sent}/{daily_limit}"
+        status_text = (f"Всего пользователей: {total_users} | "
+                       f"Неотправленных: {unsent_users} | "
+                       f"Отправлено сегодня: {today_sent}/{daily_limit}")
 
         self.status_label.setText(status_text)
 
         if today_sent >= daily_limit:
-            self.status_label.setStyleSheet('color: red;')
-        elif unsent_count > 0:
             self.status_label.setStyleSheet('color: orange;')
         else:
             self.status_label.setStyleSheet('color: green;')
@@ -1164,6 +1260,10 @@ class TelegramBotApp(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName('Telegram Bot Sender')
+    app.setApplicationVersion('1.0')
+
+    # Устанавливаем стиль
+    app.setStyle('Fusion')
 
     window = TelegramBotApp()
     window.show()
