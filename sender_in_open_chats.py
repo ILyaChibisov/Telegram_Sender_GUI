@@ -5,8 +5,9 @@ import random
 from datetime import datetime, timedelta
 from telethon import TelegramClient
 from telethon.errors import SessionPasswordNeededError, FloodWaitError, ChatWriteForbiddenError, ChannelPrivateError, \
-    InviteRequestSentError
-from telethon.tl.functions.messages import GetDialogsRequest, ImportChatInviteRequest, DeleteMessagesRequest
+    InviteRequestSentError, UserAlreadyParticipantError
+from telethon.tl.functions.messages import GetDialogsRequest, ImportChatInviteRequest
+from telethon.tl.functions.channels import JoinChannelRequest, LeaveChannelRequest
 from telethon.tl.types import InputPeerEmpty, Channel, ChatForbidden
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QVBoxLayout,
                              QHBoxLayout, QWidget, QComboBox, QTextEdit,
@@ -87,6 +88,7 @@ class ChatsManager:
                                 can_video = parts[5] == 'True'
                                 status = parts[6] if len(parts) > 6 else 'не отправлено'
                                 send_time = parts[7] if len(parts) > 7 else ''
+                                username = parts[8] if len(parts) > 8 else ''
 
                                 chats[chat_id] = {
                                     'title': chat_title,
@@ -95,7 +97,8 @@ class ChatsManager:
                                     'can_text': can_text,
                                     'can_video': can_video,
                                     'status': status,
-                                    'send_time': send_time
+                                    'send_time': send_time,
+                                    'username': username
                                 }
             except Exception as e:
                 print(f"Ошибка загрузки файла чатов: {e}")
@@ -114,8 +117,9 @@ class ChatsManager:
                     can_video = str(data['can_video'])
                     status = data['status']
                     send_time = data.get('send_time', '')
+                    username = data.get('username', '')
                     f.write(
-                        f"{chat_id},{title},{chat_type},{access_type},{can_text},{can_video},{status},{send_time}\n")
+                        f"{chat_id},{title},{chat_type},{access_type},{can_text},{can_video},{status},{send_time},{username}\n")
             return True
         except Exception as e:
             print(f"Ошибка сохранения файла чатов: {e}")
@@ -174,7 +178,6 @@ class ChatsManager:
         return today_sent
 
 
-# Классы авторизации остаются без изменений
 class SendCodeThread(QThread):
     finished = pyqtSignal(bool, str, str)
     error = pyqtSignal(str)
@@ -442,14 +445,14 @@ class AuthDialog(QDialog):
         QMessageBox.critical(self, 'Ошибка авторизации', error_message)
 
 
-class SearchChatsThread(QThread):
+class GlobalSearchThread(QThread):
     finished = pyqtSignal(dict)
     progress = pyqtSignal(str)
     error = pyqtSignal(str)
 
     def __init__(self, search_query, limit=50):
         super().__init__()
-        self.search_query = search_query.lower()
+        self.search_query = search_query
         self.limit = limit
 
     def run(self):
@@ -459,7 +462,7 @@ class SearchChatsThread(QThread):
             asyncio.set_event_loop(loop)
 
             client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
-            result = loop.run_until_complete(self.search_chats(client))
+            result = loop.run_until_complete(self.global_search(client))
             self.finished.emit(result)
 
         except Exception as e:
@@ -468,105 +471,114 @@ class SearchChatsThread(QThread):
             if loop and not loop.is_closed():
                 loop.close()
 
-    async def search_chats(self, client):
-        await client.connect()
-        if not client.is_connected():
-            await client.connect()
+    async def global_search(self, client):
+        """Улучшенный глобальный поиск чатов"""
+        found_chats = {}
+        count = 0
 
-        if not await client.is_user_authorized():
-            await client.disconnect()
-            raise Exception("Пользователь не авторизован")
+        # Загружаем существующие чаты для проверки дубликатов
+        existing_chats = ChatsManager.load_chats()
 
         try:
-            found_chats = {}
-            count = 0
+            await client.connect()
+            if not await client.is_user_authorized():
+                await client.disconnect()
+                raise Exception("Пользователь не авторизован")
 
-            self.progress.emit("🔍 Ищем публичные чаты и каналы...")
+            self.progress.emit("🔍 Начинаем глобальный поиск...")
 
-            # Получаем все диалоги
-            dialogs = await client.get_dialogs(limit=100)
+            # Метод 1: Поиск через метод поиска Telegram
+            try:
+                self.progress.emit("🌐 Ищем через глобальный поиск...")
+                search_results = await client.get_dialogs(limit=100)
 
-            for dialog in dialogs:
-                try:
+                for dialog in search_results:
                     if count >= self.limit:
                         break
 
-                    # Пропускаем личные чаты
-                    if dialog.is_user:
+                    if not dialog.is_channel and not dialog.is_group:
                         continue
 
                     entity = dialog.entity
-                    chat_name = dialog.name.lower()
+                    chat_title = dialog.name.lower()
 
-                    # Поиск без учета регистра
-                    if self.search_query and self.search_query not in chat_name:
+                    # Фильтрация по поисковому запросу
+                    if self.search_query and self.search_query.lower() not in chat_title:
                         continue
 
-                    # Определяем тип чата
-                    if isinstance(entity, Channel):
-                        if entity.broadcast:
+                    try:
+                        # Получаем полную информацию о чате
+                        full_chat = await client.get_entity(entity.id)
+
+                        chat_id = str(full_chat.id)
+
+                        # Пропускаем чаты, которые уже есть в списке
+                        if chat_id in existing_chats:
+                            self.progress.emit(f"⏭️ Пропускаем {dialog.name} - уже в списке")
+                            continue
+
+                        if chat_id in found_chats:
+                            continue
+
+                        # Определяем тип чата
+                        if hasattr(full_chat, 'broadcast') and full_chat.broadcast:
                             chat_type = "Канал"
-                        elif entity.megagroup:
+                        elif hasattr(full_chat, 'megagroup') and full_chat.megagroup:
                             chat_type = "Супергруппа"
                         else:
                             chat_type = "Группа"
-                    else:
-                        chat_type = "Чат"
 
-                    # Проверяем доступность
-                    access_type = "Открытый"
-                    can_text = False
-                    can_video = False
-
-                    try:
-                        # Пробуем получить информацию о чате
-                        await client.get_participants(entity, limit=1)
-                        access_type = "Открытый"
-
-                        # Проверяем возможность отправки текста с последующим удалением
-                        try:
-                            test_message = await client.send_message(entity, "Привет!", silent=True)
-                            await asyncio.sleep(1)  # Ждем немного перед удалением
-                            await client.delete_messages(entity, [test_message.id])
-                            can_text = True
-                        except:
-                            can_text = False
-
-                        # Проверяем возможность отправки видео с последующим удалением
-                        if can_text:
-                            try:
-                                # Создаем маленький тестовый файл
-                                test_file = "test_video.mp4"
-                                with open(test_file, 'w') as f:
-                                    f.write("test")
-
-                                test_video = await client.send_file(entity, test_file, silent=True)
-                                await asyncio.sleep(1)  # Ждем немного перед удалением
-                                await client.delete_messages(entity, [test_video.id])
-                                can_video = True
-                                os.remove(test_file)
-                            except:
-                                can_video = False
-
-                    except (ChannelPrivateError, ChatWriteForbiddenError):
+                        # Пробуем вступить в чат и проверить доступность
                         access_type = "Закрытый"
-                        # Для закрытых чатов пробуем отправить запрос на вступление
-                        try:
-                            if hasattr(entity, 'username') and entity.username:
-                                await client(ImportChatInviteRequest(entity.username))
-                                access_type = "Запрос отправлен"
-                                can_text = True
-                                can_video = True
-                        except InviteRequestSentError:
-                            access_type = "Запрос отправлен"
-                            can_text = True
-                            can_video = True
-                        except:
-                            access_type = "Закрытый"
+                        can_text = False
+                        can_video = False
+                        username = getattr(full_chat, 'username', '')
 
-                    # Сохраняем чат
-                    chat_id = str(entity.id)
-                    if chat_id not in found_chats:
+                        try:
+                            # Пробуем вступить в чат
+                            if hasattr(full_chat, 'username') and full_chat.username:
+                                try:
+                                    await client(JoinChannelRequest(full_chat.username))
+                                    self.progress.emit(f"✅ Вступили в: {dialog.name}")
+                                    access_type = "Открытый"
+                                except UserAlreadyParticipantError:
+                                    access_type = "Уже участник"
+                                except Exception as e:
+                                    self.progress.emit(f"❌ Не удалось вступить в {dialog.name}: {str(e)}")
+
+                            # Проверяем возможность отправки сообщений
+                            try:
+                                test_message = await client.send_message(full_chat, "Привет!", silent=True)
+                                await asyncio.sleep(1)
+                                await client.delete_messages(full_chat, [test_message.id])
+                                can_text = True
+
+                                # Проверяем возможность отправки видео
+                                try:
+                                    with tempfile.NamedTemporaryFile(suffix='.txt', delete=False) as f:
+                                        f.write(b"test video content")
+                                        test_file = f.name
+
+                                    test_video = await client.send_file(full_chat, test_file, caption="Тест видео")
+                                    await asyncio.sleep(1)
+                                    await client.delete_messages(full_chat, [test_video.id])
+                                    can_video = True
+                                    os.unlink(test_file)
+                                except Exception as e:
+                                    can_video = False
+                                    if os.path.exists(test_file):
+                                        try:
+                                            os.unlink(test_file)
+                                        except:
+                                            pass
+
+                            except Exception as e:
+                                can_text = False
+
+                        except Exception as e:
+                            self.progress.emit(f"⚠️ Ошибка проверки {dialog.name}: {str(e)}")
+
+                        # Сохраняем найденный чат
                         found_chats[chat_id] = {
                             'title': dialog.name,
                             'type': chat_type,
@@ -574,83 +586,165 @@ class SearchChatsThread(QThread):
                             'can_text': can_text,
                             'can_video': can_video,
                             'status': 'не отправлено',
-                            'send_time': ''
+                            'send_time': '',
+                            'username': username
                         }
                         count += 1
-                        self.progress.emit(f"✅ Найдено: {count} - {dialog.name} ({access_type})")
+                        self.progress.emit(f"✅ Найден новый: {count} - {dialog.name} ({access_type})")
 
-                except Exception as e:
-                    continue
+                    except Exception as e:
+                        continue
 
-            # Поиск в глобальном поиске
-            self.progress.emit("🌐 Ищем в глобальном поиске...")
+            except Exception as e:
+                self.progress.emit(f"⚠️ Ошибка поиска: {str(e)}")
+
+            # Метод 2: Поиск через известные публичные каналы
             try:
-                # Используем поиск по публичным каналам и группам
-                result = await client(GetDialogsRequest(
-                    offset_date=None,
-                    offset_id=0,
-                    offset_peer=InputPeerEmpty(),
-                    limit=100,
-                    hash=0
-                ))
+                self.progress.emit("📢 Ищем в популярных каналах...")
+                popular_channels = [
+                    '@telegram', '@telegramtips', '@tgchannel',
+                    '@test', '@news', '@breakingnews'
+                ]
 
-                for chat in result.chats:
+                for channel in popular_channels:
                     if count >= self.limit:
                         break
 
-                    if isinstance(chat, Channel):
-                        chat_name = chat.title.lower()
+                    try:
+                        entity = await client.get_entity(channel)
+                        chat_id = str(entity.id)
 
-                        # Поиск без учета регистра
-                        if self.search_query and self.search_query not in chat_name:
+                        # Пропускаем чаты, которые уже есть в списке
+                        if chat_id in existing_chats:
+                            self.progress.emit(f"⏭️ Пропускаем {channel} - уже в списке")
                             continue
 
-                        # Проверяем доступность
+                        if chat_id in found_chats:
+                            continue
+
+                        # Проверяем соответствие поисковому запросу
+                        chat_title = getattr(entity, 'title', '').lower()
+                        if self.search_query and self.search_query.lower() not in chat_title:
+                            continue
+
+                        # Аналогичная проверка доступности
                         access_type = "Открытый"
                         can_text = False
                         can_video = False
+                        username = getattr(entity, 'username', '')
 
                         try:
-                            # Пробуем получить информацию
-                            await client.get_participants(chat, limit=1)
+                            await client(JoinChannelRequest(channel))
 
-                            # Проверяем отправку сообщений с последующим удалением
+                            # Проверка отправки сообщений
                             try:
-                                test_message = await client.send_message(chat, "Привет!", silent=True)
+                                test_message = await client.send_message(entity, "Привет!", silent=True)
                                 await asyncio.sleep(1)
-                                await client.delete_messages(chat, [test_message.id])
+                                await client.delete_messages(entity, [test_message.id])
                                 can_text = True
                             except:
                                 can_text = False
 
-                        except (ChannelPrivateError, ChatWriteForbiddenError):
+                        except UserAlreadyParticipantError:
+                            access_type = "Уже участник"
+                        except Exception as e:
                             access_type = "Закрытый"
 
-                        chat_id = str(chat.id)
-                        if chat_id not in found_chats:
-                            found_chats[chat_id] = {
-                                'title': chat.title,
-                                'type': "Канал" if chat.broadcast else "Группа",
-                                'access_type': access_type,
-                                'can_text': can_text,
-                                'can_video': can_video,
-                                'status': 'не отправлено',
-                                'send_time': ''
-                            }
-                            count += 1
-                            self.progress.emit(f"✅ Найдено: {count} - {chat.title} ({access_type})")
+                        found_chats[chat_id] = {
+                            'title': getattr(entity, 'title', channel),
+                            'type': "Канал",
+                            'access_type': access_type,
+                            'can_text': can_text,
+                            'can_video': can_video,
+                            'status': 'не отправлено',
+                            'send_time': '',
+                            'username': username
+                        }
+                        count += 1
+                        self.progress.emit(f"📢 Найден новый: {count} - {channel}")
+
+                    except Exception as e:
+                        continue
 
             except Exception as e:
-                print(f"Ошибка глобального поиска: {e}")
+                self.progress.emit(f"⚠️ Ошибка поиска в популярных каналах: {str(e)}")
 
             await client.disconnect()
 
             if not found_chats:
-                self.progress.emit("❌ Чаты не найдены. Попробуйте другой запрос.")
+                self.progress.emit("❌ Новые чаты не найдены. Попробуйте другой запрос.")
             else:
-                self.progress.emit(f"🎯 Поиск завершен. Найдено: {len(found_chats)} чатов")
+                self.progress.emit(f"🎯 Поиск завершен. Найдено новых чатов: {len(found_chats)}")
 
             return found_chats
+
+        except Exception as e:
+            try:
+                await client.disconnect()
+            except:
+                pass
+            raise e
+
+
+class LeaveChatsThread(QThread):
+    """Поток для выхода из чатов, которые не были добавлены в список рассылки"""
+    progress = pyqtSignal(str)
+    finished = pyqtSignal(int)
+    error = pyqtSignal(str)
+
+    def __init__(self, chat_ids_to_keep):
+        super().__init__()
+        self.chat_ids_to_keep = chat_ids_to_keep  # ID чатов, которые нужно сохранить
+
+    def run(self):
+        loop = None
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+            client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
+            result = loop.run_until_complete(self.leave_unused_chats(client))
+            self.finished.emit(result)
+
+        except Exception as e:
+            self.error.emit(str(e))
+        finally:
+            if loop and not loop.is_closed():
+                loop.close()
+
+    async def leave_unused_chats(self, client):
+        """Выходит из чатов, которые не входят в список для сохранения"""
+        await client.connect()
+        if not await client.is_user_authorized():
+            await client.disconnect()
+            raise Exception("Пользователь не авторизован")
+
+        try:
+            left_count = 0
+
+            # Получаем все текущие диалоги
+            dialogs = await client.get_dialogs(limit=100)
+
+            for dialog in dialogs:
+                if not dialog.is_channel and not dialog.is_group:
+                    continue
+
+                entity = dialog.entity
+                chat_id = str(entity.id)
+
+                # Если чат не в списке для сохранения - выходим из него
+                if chat_id not in self.chat_ids_to_keep:
+                    try:
+                        if hasattr(entity, 'username') and entity.username:
+                            await client(LeaveChannelRequest(entity))
+                            self.progress.emit(f"🚪 Выходим из: {dialog.name}")
+                            left_count += 1
+                            await asyncio.sleep(1)  # Задержка между выходами
+                    except Exception as e:
+                        self.progress.emit(f"⚠️ Не удалось выйти из {dialog.name}: {str(e)}")
+
+            await client.disconnect()
+            return left_count
 
         except Exception as e:
             await client.disconnect()
@@ -1140,6 +1234,7 @@ class TelegramBotApp(QMainWindow):
         super().__init__()
         self.settings = SettingsManager.load_settings()
         self.auto_send_thread = None
+        self.leave_chats_thread = None
         self.is_authorized = False
         self.selected_chats_for_sending = set()
         self.video_path = None
@@ -1231,6 +1326,13 @@ class TelegramBotApp(QMainWindow):
         self.delete_chats_btn.setStyleSheet('background-color: #f44336; color: white; font-weight: bold;')
         self.delete_chats_btn.clicked.connect(self.delete_selected_chats)
         saved_buttons.addWidget(self.delete_chats_btn)
+
+        # Добавляем кнопку очистки чатов
+        self.cleanup_chats_btn = QPushButton('🧹 Очистить неиспользуемые чаты')
+        self.cleanup_chats_btn.setStyleSheet('background-color: #FF5722; color: white; font-weight: bold;')
+        self.cleanup_chats_btn.clicked.connect(self.cleanup_unused_chats)
+        self.cleanup_chats_btn.setToolTip('Выйдет из всех чатов, которые не добавлены в список рассылки')
+        saved_buttons.addWidget(self.cleanup_chats_btn)
 
         saved_layout.addLayout(saved_buttons)
 
@@ -1333,7 +1435,6 @@ class TelegramBotApp(QMainWindow):
 
         self.update_stats()
 
-    # Остальные методы остаются аналогичными предыдущей версии
     def check_authorization(self):
         loop = None
         try:
@@ -1408,14 +1509,15 @@ class TelegramBotApp(QMainWindow):
             return
 
         search_query = self.search_edit.text().strip()
-        self.search_btn.setEnabled(False)
-        self.search_btn.setText('Поиск...')
 
-        self.search_thread = SearchChatsThread(search_query, 50)
-        self.search_thread.finished.connect(self.on_search_finished)
-        self.search_thread.progress.connect(self.on_search_progress)
-        self.search_thread.error.connect(self.on_search_error)
-        self.search_thread.start()
+        self.search_btn.setEnabled(False)
+        self.search_btn.setText('Глобальный поиск...')
+
+        self.global_search_thread = GlobalSearchThread(search_query, 30)
+        self.global_search_thread.finished.connect(self.on_search_finished)
+        self.global_search_thread.progress.connect(self.on_search_progress)
+        self.global_search_thread.error.connect(self.on_search_error)
+        self.global_search_thread.start()
 
     def on_search_progress(self, message):
         self.statusBar().showMessage(message)
@@ -1423,7 +1525,7 @@ class TelegramBotApp(QMainWindow):
     def on_search_finished(self, found_chats):
         self.search_btn.setEnabled(True)
         self.search_btn.setText('🔍 Найти')
-        self.statusBar().showMessage(f'Найдено чатов: {len(found_chats)}')
+        self.statusBar().showMessage(f'Найдено новых чатов: {len(found_chats)}')
 
         # Очищаем предыдущие результаты
         for i in reversed(range(self.found_chats_layout.count())):
@@ -1438,7 +1540,7 @@ class TelegramBotApp(QMainWindow):
             self.found_chats_layout.addWidget(chat_widget)
 
         if not found_chats:
-            no_chats_label = QLabel('Чаты не найдены. Попробуйте другой запрос.')
+            no_chats_label = QLabel('Новые чаты не найдены. Попробуйте другой запрос.')
             no_chats_label.setStyleSheet('color: gray; font-style: italic; padding: 20px;')
             no_chats_label.setAlignment(Qt.AlignCenter)
             self.found_chats_layout.addWidget(no_chats_label)
@@ -1466,6 +1568,12 @@ class TelegramBotApp(QMainWindow):
         if ChatsManager.add_chats(selected_chats):
             QMessageBox.information(self, 'Успех', f'Сохранено чатов: {len(selected_chats)}')
             self.update_stats()
+
+            # Автоматически добавляем сохраненные чаты в выбранные для рассылки
+            for chat_id in selected_chats.keys():
+                self.selected_chats_for_sending.add(chat_id)
+            self.selected_chats_info.setText(f'Выбрано чатов: {len(self.selected_chats_for_sending)}')
+
         else:
             QMessageBox.warning(self, 'Ошибка', 'Не удалось сохранить чаты')
 
@@ -1491,11 +1599,9 @@ class TelegramBotApp(QMainWindow):
             QMessageBox.information(self, 'Успех', f'Выбрано {len(self.selected_chats_for_sending)} чатов для рассылки')
 
     def delete_selected_chats(self):
-        """Удаляет выбранные чаты из сохраненного списка"""
+        """Удаляет выбранные чаты и выходит из них"""
         chats_to_delete = []
 
-        # В реальном приложении здесь нужно получить выбранные чаты из интерфейса
-        # Для простоты покажем диалог выбора
         dialog = SelectChatsDialog(self)
         dialog.load_chats()
         dialog.setWindowTitle('Выберите чаты для удаления')
@@ -1506,10 +1612,14 @@ class TelegramBotApp(QMainWindow):
             return
 
         reply = QMessageBox.question(self, 'Подтверждение',
-                                     f'Вы уверены, что хотите удалить {len(chats_to_delete)} чатов?',
+                                     f'Вы уверены, что хотите удалить {len(chats_to_delete)} чатов и выйти из них?',
                                      QMessageBox.Yes | QMessageBox.No)
 
         if reply == QMessageBox.Yes:
+            # Сначала выходим из чатов
+            self.leave_chats_after_deletion(chats_to_delete)
+
+            # Затем удаляем из списка
             if ChatsManager.delete_chats(chats_to_delete):
                 QMessageBox.information(self, 'Успех', f'Удалено {len(chats_to_delete)} чатов')
                 self.update_stats()
@@ -1518,6 +1628,85 @@ class TelegramBotApp(QMainWindow):
                 self.selected_chats_info.setText(f'Выбрано чатов: {len(self.selected_chats_for_sending)}')
             else:
                 QMessageBox.warning(self, 'Ошибка', 'Не удалось удалить чаты')
+
+    def cleanup_unused_chats(self):
+        """Очищает неиспользуемые чаты - выходит из тех, что не в списке рассылки"""
+        if not self.is_authorized:
+            QMessageBox.warning(self, 'Ошибка', 'Сначала авторизуйтесь!')
+            return
+
+        reply = QMessageBox.question(self, 'Подтверждение',
+                                     'Вы уверены, что хотите выйти из всех чатов, не добавленных в список рассылки?',
+                                     QMessageBox.Yes | QMessageBox.No)
+
+        if reply != QMessageBox.Yes:
+            return
+
+        # Получаем ID чатов, которые нужно сохранить (все сохраненные чаты)
+        saved_chats = ChatsManager.load_chats()
+        chat_ids_to_keep = set(saved_chats.keys())
+
+        self.cleanup_chats_btn.setEnabled(False)
+        self.statusBar().showMessage('Начинаем очистку неиспользуемых чатов...')
+
+        self.leave_chats_thread = LeaveChatsThread(chat_ids_to_keep)
+        self.leave_chats_thread.progress.connect(self.on_leave_progress)
+        self.leave_chats_thread.finished.connect(self.on_leave_finished)
+        self.leave_chats_thread.error.connect(self.on_leave_error)
+        self.leave_chats_thread.start()
+
+    def on_leave_progress(self, message):
+        self.statusBar().showMessage(message)
+
+    def on_leave_finished(self, left_count):
+        self.cleanup_chats_btn.setEnabled(True)
+        self.statusBar().showMessage(f'Очистка завершена. Выход из {left_count} чатов')
+        QMessageBox.information(self, 'Очистка завершена', f'Выход из {left_count} неиспользуемых чатов')
+
+    def on_leave_error(self, error_message):
+        self.cleanup_chats_btn.setEnabled(True)
+        QMessageBox.critical(self, 'Ошибка очистки', error_message)
+
+    def leave_chats_after_deletion(self, chat_ids):
+        """Выходит из указанных чатов после их удаления из списка"""
+        loop = None
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+            client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
+            loop.run_until_complete(self._leave_chats(client, chat_ids))
+
+        except Exception as e:
+            print(f"Ошибка при выходе из чатов: {e}")
+        finally:
+            if loop and not loop.is_closed():
+                loop.close()
+
+    async def _leave_chats(self, client, chat_ids):
+        """Асинхронный метод для выхода из чатов"""
+        await client.connect()
+        if not await client.is_user_authorized():
+            await client.disconnect()
+            return
+
+        try:
+            chats = ChatsManager.load_chats()
+            for chat_id in chat_ids:
+                if chat_id in chats:
+                    chat_data = chats[chat_id]
+                    try:
+                        entity = await client.get_entity(int(chat_id))
+                        await client(LeaveChannelRequest(entity))
+                        print(f"✅ Вышли из чата: {chat_data['title']}")
+                    except Exception as e:
+                        print(f"❌ Не удалось выйти из {chat_data['title']}: {str(e)}")
+                    await asyncio.sleep(1)  # Задержка между выходами
+
+            await client.disconnect()
+        except Exception as e:
+            await client.disconnect()
+            raise e
 
     def load_video(self):
         file_path, _ = QFileDialog.getOpenFileName(

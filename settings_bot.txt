@@ -1,0 +1,4 @@
+daily_limit=10
+min_delay=3600
+max_delay=5400
+bot_token=7067270067:AAFo59vra1hq3teHqfDJGBFhcfzQnssElz0
