@@ -22,7 +22,8 @@ import re
 API_ID = '21339848'
 API_HASH = '3bc2385cae1af7eb7bc29302e69233a6'
 
-SESSION_FILE = os.path.join(tempfile.gettempdir(), 'telegram_comments_session')
+# ИСПРАВЛЕНО: Используем тот же файл сессии что и в sender_in_open_chats.py
+SESSION_FILE = os.path.join(tempfile.gettempdir(), 'telegram_session')  # Теперь тот же файл
 COMMENTS_FILE = 'comments_chats_list.txt'
 SETTINGS_FILE = 'comments_settings.txt'
 
@@ -1033,10 +1034,9 @@ class AutoCommentsThread(QThread):
 
                         sent_count += 1
                         today_sent += 1
-                        remaining_limit = self.daily_limit - today_sent
 
                         self.progress.emit(
-                            f"✅ Комментарий отправлен в {chat_title} ({sent_count}/{remaining_limit})",
+                            f"✅ Комментарий отправлен в {chat_title} ({sent_count}/{remaining_limit} за сегодня)",
                             i + 1, len(chat_ids)
                         )
 
@@ -1060,305 +1060,320 @@ class AutoCommentsThread(QThread):
                             f"❌ Ошибка в {chat_title}: {str(e)}",
                             i, len(chat_ids)
                         )
-                        CommentsManager.update_chat_status(chat_id, 'ошибка')
 
                 if sent_count == 0:
                     self.progress.emit(
                         "❌ Не удалось отправить ни одного комментария",
                         0, 1
                     )
-                    break
 
-                if sent_count < len(chat_ids):
+                if sent_count < remaining_limit:
+                    next_delay = random.randint(self.min_delay, self.max_delay)
+                    next_delay_minutes = next_delay // 60
+                    next_delay_secs = next_delay % 60
+
                     self.progress.emit(
-                        f"⏳ Все комментарии отправлены. Ждем следующего дня...",
-                        len(chat_ids), len(chat_ids)
+                        f"⏰ Следующий цикл через {next_delay_minutes} мин {next_delay_secs} сек",
+                        0, 1
                     )
 
-                    tomorrow = datetime.now() + timedelta(days=1)
-                    wait_until = tomorrow.replace(hour=11, minute=0, second=0, microsecond=0)
-                    wait_seconds = (wait_until - datetime.now()).total_seconds()
-
-                    for sec in range(int(wait_seconds)):
+                    for sec in range(next_delay):
                         if not self.is_running:
                             await client.disconnect()
                             return "⏹️ Автоматическая рассылка комментариев остановлена"
                         await asyncio.sleep(1)
 
             await client.disconnect()
-            return "✅ Автоматическая рассылка комментариев завершена"
+            return "⏹️ Автоматическая рассылка комментариев остановлена"
 
         except Exception as e:
             await client.disconnect()
             raise e
 
 
-class CommentsMainWindow(QMainWindow):
+class CommentsSenderApp(QMainWindow):
     def __init__(self):
         super().__init__()
+        self.auto_thread = None
         self.init_ui()
-        self.load_chats()
         self.load_settings()
-        self.check_auth_status()
+        self.load_chats()
+        self.check_auth()
 
     def init_ui(self):
-        self.setWindowTitle('Telegram Comments Bot - Автоматическая рассылка комментариев')
+        self.setWindowTitle('Telegram - Автоматические комментарии в открытых группах')
         self.setGeometry(100, 100, 1200, 800)
 
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
+        layout = QVBoxLayout(central_widget)
 
-        main_layout = QHBoxLayout()
-        central_widget.setLayout(main_layout)
+        # Заголовок
+        title_label = QLabel('📢 Автоматические комментарии в открытых группах')
+        title_label.setStyleSheet('font-size: 18px; font-weight: bold; color: #2E86AB; margin: 10px;')
+        layout.addWidget(title_label)
 
-        splitter = QSplitter(Qt.Horizontal)
-        main_layout.addWidget(splitter)
-
-        left_widget = QWidget()
-        left_layout = QVBoxLayout()
-        left_widget.setLayout(left_layout)
-
-        right_widget = QWidget()
-        right_layout = QVBoxLayout()
-        right_widget.setLayout(right_layout)
-
-        splitter.addWidget(left_widget)
-        splitter.addWidget(right_widget)
-        splitter.setSizes([400, 800])
-
-        # Левая панель - управление
-        auth_group = QGroupBox("Авторизация")
-        auth_layout = QVBoxLayout()
-        self.auth_status_label = QLabel("❌ Не авторизован")
-        self.auth_status_label.setStyleSheet("color: red; font-weight: bold;")
+        # Статус авторизации
+        auth_layout = QHBoxLayout()
+        self.auth_status_label = QLabel('🔐 Статус авторизации: Проверка...')
+        self.auth_status_label.setStyleSheet('font-size: 12px; color: orange;')
         auth_layout.addWidget(self.auth_status_label)
+        auth_layout.addStretch()
+        self.auth_button = QPushButton('Авторизоваться')
+        self.auth_button.setStyleSheet('background-color: #4CAF50; color: white; font-weight: bold;')
+        self.auth_button.clicked.connect(self.auth_button_clicked)
+        auth_layout.addWidget(self.auth_button)
+        layout.addLayout(auth_layout)
 
-        self.auth_btn = QPushButton("Авторизоваться")
-        self.auth_btn.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold;")
-        self.auth_btn.clicked.connect(self.show_auth_dialog)
-        auth_layout.addWidget(self.auth_btn)
+        # Разделитель
+        layout.addWidget(QLabel('_' * 100))
 
-        self.logout_btn = QPushButton("Выйти")
-        self.logout_btn.setStyleSheet("background-color: #f44336; color: white;")
-        self.logout_btn.clicked.connect(self.logout)
-        auth_layout.addWidget(self.logout_btn)
-        auth_group.setLayout(auth_layout)
-        left_layout.addWidget(auth_group)
+        # Поиск и добавление чатов
+        search_group = QGroupBox('🔍 Поиск и добавление чатов с комментариями')
+        search_layout = QVBoxLayout(search_group)
 
-        # Поиск чатов
-        search_group = QGroupBox("Поиск чатов с комментариями")
-        search_layout = QVBoxLayout()
-
-        search_layout.addWidget(QLabel("Поисковый запрос:"))
+        search_input_layout = QHBoxLayout()
+        search_input_layout.addWidget(QLabel('Поиск:'))
         self.search_edit = QLineEdit()
-        self.search_edit.setPlaceholderText("Введите запрос для поиска (например: новости, спорт)")
-        search_layout.addWidget(self.search_edit)
+        self.search_edit.setPlaceholderText('Введите ключевое слово для поиска каналов с комментариями...')
+        search_input_layout.addWidget(self.search_edit)
 
-        search_layout.addWidget(QLabel("Лимит поиска:"))
         self.limit_spin = QSpinBox()
-        self.limit_spin.setRange(1, 100)
-        self.limit_spin.setValue(20)
-        search_layout.addWidget(self.limit_spin)
+        self.limit_spin.setRange(10, 200)
+        self.limit_spin.setValue(50)
+        self.limit_spin.setSuffix(' чатов')
+        search_input_layout.addWidget(QLabel('Лимит:'))
+        search_input_layout.addWidget(self.limit_spin)
 
-        self.search_btn = QPushButton("🔍 Начать поиск")
-        self.search_btn.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold;")
-        self.search_btn.clicked.connect(self.start_search)
-        search_layout.addWidget(self.search_btn)
+        self.search_button = QPushButton('Найти чаты')
+        self.search_button.setStyleSheet('background-color: #2196F3; color: white; font-weight: bold;')
+        self.search_button.clicked.connect(self.search_comments_chats)
+        search_input_layout.addWidget(self.search_button)
 
-        self.progress_label = QLabel("Готов к поиску...")
-        self.progress_label.setStyleSheet("color: blue;")
-        search_layout.addWidget(self.progress_label)
+        search_layout.addLayout(search_input_layout)
 
-        search_group.setLayout(search_layout)
-        left_layout.addWidget(search_group)
+        self.search_progress_label = QLabel('')
+        self.search_progress_label.setStyleSheet('color: blue; font-size: 11px;')
+        search_layout.addWidget(self.search_progress_label)
 
-        # Управление списком
-        list_group = QGroupBox("Управление списком чатов")
-        list_layout = QVBoxLayout()
+        layout.addWidget(search_group)
 
-        self.leave_chats_btn = QPushButton("🚪 Выйти из неиспользуемых чатов")
-        self.leave_chats_btn.setStyleSheet("background-color: #FF9800; color: white;")
-        self.leave_chats_btn.clicked.connect(self.leave_unused_chats)
-        list_layout.addWidget(self.leave_chats_btn)
+        # Список чатов
+        chats_group = QGroupBox('📋 Список чатов для комментирования')
+        chats_layout = QVBoxLayout(chats_group)
 
-        self.delete_chats_btn = QPushButton("🗑️ Удалить выбранные чаты")
-        self.delete_chats_btn.setStyleSheet("background-color: #f44336; color: white;")
-        self.delete_chats_btn.clicked.connect(self.delete_selected_chats)
-        list_layout.addWidget(self.delete_chats_btn)
+        # Фильтры
+        filter_layout = QHBoxLayout()
+        filter_layout.addWidget(QLabel('Фильтр:'))
+        self.filter_combo = QComboBox()
+        self.filter_combo.addItems(['Все', 'Не отправлено', 'Отправлено', 'С видео', 'Без видео'])
+        self.filter_combo.currentTextChanged.connect(self.filter_chats)
+        filter_layout.addWidget(self.filter_combo)
 
-        self.select_all_btn = QPushButton("☑️ Выбрать все")
-        self.select_all_btn.clicked.connect(self.select_all_chats)
-        list_layout.addWidget(self.select_all_btn)
+        filter_layout.addStretch()
+        self.select_all_checkbox = QCheckBox('Выбрать все')
+        self.select_all_checkbox.stateChanged.connect(self.toggle_select_all)
+        filter_layout.addWidget(self.select_all_checkbox)
 
-        self.deselect_all_btn = QPushButton("◻️ Снять выделение")
-        self.deselect_all_btn.clicked.connect(self.deselect_all_chats)
-        list_layout.addWidget(self.deselect_all_btn)
+        self.delete_selected_button = QPushButton('Удалить выбранные')
+        self.delete_selected_button.setStyleSheet('background-color: #f44336; color: white;')
+        self.delete_selected_button.clicked.connect(self.delete_selected_chats)
+        filter_layout.addWidget(self.delete_selected_button)
 
-        list_group.setLayout(list_layout)
-        left_layout.addWidget(list_group)
+        self.leave_unused_button = QPushButton('Выйти из лишних чатов')
+        self.leave_unused_button.setStyleSheet('background-color: #FF9800; color: white;')
+        self.leave_unused_button.clicked.connect(self.leave_unused_chats)
+        filter_layout.addWidget(self.leave_unused_button)
 
-        # Настройки
-        settings_group = QGroupBox("Настройки рассылки")
-        settings_layout = QVBoxLayout()
+        chats_layout.addLayout(filter_layout)
 
-        settings_layout.addWidget(QLabel("Дневной лимит комментариев:"))
+        # Список чатов
+        self.chats_list = QListWidget()
+        self.chats_list.itemChanged.connect(self.on_chat_item_changed)
+        chats_layout.addWidget(self.chats_list)
+
+        layout.addWidget(chats_group)
+
+        # Статистика
+        stats_layout = QHBoxLayout()
+        self.stats_label = QLabel('Всего: 0 | Не отправлено: 0 | Отправлено: 0 | Сегодня: 0')
+        self.stats_label.setStyleSheet('font-size: 12px; color: #666;')
+        stats_layout.addWidget(self.stats_label)
+        stats_layout.addStretch()
+        layout.addLayout(stats_layout)
+
+        # Настройки сообщения
+        message_group = QGroupBox('💬 Настройки комментария')
+        message_layout = QVBoxLayout(message_group)
+
+        self.message_edit = QTextEdit()
+        self.message_edit.setPlaceholderText('Введите текст комментария...')
+        self.message_edit.setMaximumHeight(80)
+        message_layout.addWidget(self.message_edit)
+
+        video_layout = QHBoxLayout()
+        self.video_path_edit = QLineEdit()
+        self.video_path_edit.setPlaceholderText('Путь к видеофайлу (опционально)...')
+        video_layout.addWidget(self.video_path_edit)
+
+        self.browse_video_button = QPushButton('Обзор')
+        self.browse_video_button.clicked.connect(self.browse_video)
+        video_layout.addWidget(self.browse_video_button)
+
+        message_layout.addLayout(video_layout)
+        layout.addWidget(message_group)
+
+        # Настройки отправки
+        settings_group = QGroupBox('⚙️ Настройки отправки')
+        settings_layout = QHBoxLayout(settings_group)
+
+        settings_layout.addWidget(QLabel('Дневной лимит:'))
         self.daily_limit_spin = QSpinBox()
-        self.daily_limit_spin.setRange(1, 50)
+        self.daily_limit_spin.setRange(1, 100)
         self.daily_limit_spin.setValue(10)
         settings_layout.addWidget(self.daily_limit_spin)
 
-        settings_layout.addWidget(QLabel("Мин. задержка (секунды):"))
+        settings_layout.addWidget(QLabel('Мин. задержка (сек):'))
         self.min_delay_spin = QSpinBox()
         self.min_delay_spin.setRange(60, 36000)
         self.min_delay_spin.setValue(3600)
         settings_layout.addWidget(self.min_delay_spin)
 
-        settings_layout.addWidget(QLabel("Макс. задержка (секунды):"))
+        settings_layout.addWidget(QLabel('Макс. задержка (сек):'))
         self.max_delay_spin = QSpinBox()
         self.max_delay_spin.setRange(60, 36000)
         self.max_delay_spin.setValue(5400)
         settings_layout.addWidget(self.max_delay_spin)
 
-        self.save_settings_btn = QPushButton("💾 Сохранить настройки")
-        self.save_settings_btn.setStyleSheet("background-color: #607D8B; color: white;")
-        self.save_settings_btn.clicked.connect(self.save_settings)
-        settings_layout.addWidget(self.save_settings_btn)
+        self.save_settings_button = QPushButton('Сохранить настройки')
+        self.save_settings_button.setStyleSheet('background-color: #607D8B; color: white;')
+        self.save_settings_button.clicked.connect(self.save_settings)
+        settings_layout.addWidget(self.save_settings_button)
 
-        settings_group.setLayout(settings_layout)
-        left_layout.addWidget(settings_group)
+        settings_layout.addStretch()
+        layout.addWidget(settings_group)
 
-        left_layout.addStretch()
+        # Прогресс
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        layout.addWidget(self.progress_bar)
 
-        # Правая панель - список чатов и рассылка
-        chats_group = QGroupBox("Список чатов для комментариев")
-        chats_layout = QVBoxLayout()
+        self.progress_label = QLabel('')
+        self.progress_label.setStyleSheet('color: blue; font-size: 11px;')
+        layout.addWidget(self.progress_label)
 
-        self.chats_list = QListWidget()
-        self.chats_list.setSelectionMode(QListWidget.MultiSelection)
-        chats_layout.addWidget(self.chats_list)
+        # Кнопки управления
+        buttons_layout = QHBoxLayout()
 
-        chats_group.setLayout(chats_layout)
-        right_layout.addWidget(chats_group)
+        self.send_test_button = QPushButton('📤 Тестовый комментарий')
+        self.send_test_button.setStyleSheet('background-color: #FF9800; color: white; font-weight: bold;')
+        self.send_test_button.clicked.connect(self.send_test_comment)
+        buttons_layout.addWidget(self.send_test_button)
 
-        # Сообщение для комментариев
-        message_group = QGroupBox("Сообщение для комментариев")
-        message_layout = QVBoxLayout()
+        self.start_auto_button = QPushButton('🚀 Старт авто-комментариев')
+        self.start_auto_button.setStyleSheet('background-color: #4CAF50; color: white; font-weight: bold;')
+        self.start_auto_button.clicked.connect(self.start_auto_comments)
+        buttons_layout.addWidget(self.start_auto_button)
 
-        self.message_edit = QTextEdit()
-        self.message_edit.setPlaceholderText("Введите текст комментария...")
-        self.message_edit.setMaximumHeight(100)
-        message_layout.addWidget(self.message_edit)
+        self.stop_auto_button = QPushButton('⏹️ Стоп')
+        self.stop_auto_button.setStyleSheet('background-color: #f44336; color: white; font-weight: bold;')
+        self.stop_auto_button.clicked.connect(self.stop_auto_comments)
+        self.stop_auto_button.setEnabled(False)
+        buttons_layout.addWidget(self.stop_auto_button)
 
-        video_layout = QHBoxLayout()
-        self.video_check = QCheckBox("Добавить видео")
-        video_layout.addWidget(self.video_check)
+        buttons_layout.addStretch()
+        layout.addLayout(buttons_layout)
 
-        self.video_path_edit = QLineEdit()
-        self.video_path_edit.setPlaceholderText("Путь к видеофайлу...")
-        video_layout.addWidget(self.video_path_edit)
+        # Статус
+        self.status_label = QLabel('Готов к работе')
+        self.status_label.setStyleSheet('color: green; font-weight: bold; margin: 5px;')
+        layout.addWidget(self.status_label)
 
-        self.video_browse_btn = QPushButton("Обзор")
-        self.video_browse_btn.clicked.connect(self.browse_video)
-        video_layout.addWidget(self.video_browse_btn)
+    def check_auth(self):
+        """Проверяет авторизацию используя тот же файл сессии"""
+        loop = None
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
 
-        message_layout.addLayout(video_layout)
-        message_group.setLayout(message_layout)
-        right_layout.addWidget(message_group)
+            client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
 
-        # Управление рассылкой
-        send_group = QGroupBox("Управление рассылкой комментариев")
-        send_layout = QVBoxLayout()
+            async def check_auth_internal():
+                try:
+                    await client.connect()
+                    if not client.is_connected():
+                        return False
+                    return await client.is_user_authorized()
+                except Exception:
+                    return False
+                finally:
+                    try:
+                        await client.disconnect()
+                    except:
+                        pass
 
-        stats_layout = QHBoxLayout()
-        self.stats_label = QLabel("Статистика: всего 0, выбрано 0, отправлено 0, сегодня 0")
-        stats_layout.addWidget(self.stats_label)
+            is_authorized = loop.run_until_complete(check_auth_internal())
 
-        self.refresh_btn = QPushButton("🔄 Обновить")
-        self.refresh_btn.clicked.connect(self.load_chats)
-        stats_layout.addWidget(self.refresh_btn)
+            if is_authorized:
+                self.auth_status_label.setText('🔐 Статус авторизации: Авторизован')
+                self.auth_status_label.setStyleSheet('font-size: 12px; color: green;')
+                self.auth_button.setText('Переавторизоваться')
+                return True
+            else:
+                self.auth_status_label.setText('🔐 Статус авторизации: Не авторизован')
+                self.auth_status_label.setStyleSheet('font-size: 12px; color: red;')
+                self.auth_button.setText('Авторизоваться')
+                return False
 
-        send_layout.addLayout(stats_layout)
+        except Exception as e:
+            print(f"Ошибка проверки авторизации: {e}")
+            self.auth_status_label.setText('🔐 Статус авторизации: Ошибка проверки')
+            self.auth_status_label.setStyleSheet('font-size: 12px; color: red;')
+            self.auth_button.setText('Авторизоваться')
+            return False
+        finally:
+            if loop and not loop.is_closed():
+                loop.close()
 
-        self.test_send_btn = QPushButton("🧪 Тестовый комментарий")
-        self.test_send_btn.setStyleSheet("background-color: #FFC107; color: black; font-weight: bold;")
-        self.test_send_btn.clicked.connect(self.send_test_comment)
-        send_layout.addWidget(self.test_send_btn)
-
-        self.auto_send_btn = QPushButton("🚀 Запустить авто-рассылку")
-        self.auto_send_btn.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold;")
-        self.auto_send_btn.clicked.connect(self.start_auto_send)
-        send_layout.addWidget(self.auto_send_btn)
-
-        self.stop_send_btn = QPushButton("⏹️ Остановить рассылку")
-        self.stop_send_btn.setStyleSheet("background-color: #f44336; color: white;")
-        self.stop_send_btn.clicked.connect(self.stop_auto_send)
-        self.stop_send_btn.setEnabled(False)
-        send_layout.addWidget(self.stop_send_btn)
-
-        self.send_progress = QProgressBar()
-        send_layout.addWidget(self.send_progress)
-
-        self.send_status_label = QLabel("Готов к работе...")
-        self.send_status_label.setStyleSheet("color: blue;")
-        send_layout.addWidget(self.send_status_label)
-
-        send_group.setLayout(send_layout)
-        right_layout.addWidget(send_group)
-
-        # Лог
-        log_group = QGroupBox("Лог выполнения")
-        log_layout = QVBoxLayout()
-        self.log_text = QTextEdit()
-        self.log_text.setMaximumHeight(150)
-        log_layout.addWidget(self.log_text)
-        log_group.setLayout(log_layout)
-        right_layout.addWidget(log_group)
-
-        self.auto_send_thread = None
-
-    def check_auth_status(self):
-        """Проверяет статус авторизации"""
-        if os.path.exists(SESSION_FILE):
-            self.auth_status_label.setText("✅ Авторизован")
-            self.auth_status_label.setStyleSheet("color: green; font-weight: bold;")
-            self.auth_btn.setEnabled(False)
-            self.logout_btn.setEnabled(True)
+    def auth_button_clicked(self):
+        """Обработчик нажатия кнопки авторизации"""
+        if self.check_auth():  # Если уже авторизован
+            reply = QMessageBox.question(self, 'Выход', 'Вы уверены, что хотите выйти?',
+                                         QMessageBox.Yes | QMessageBox.No)
+            if reply == QMessageBox.Yes:
+                self.logout()
         else:
-            self.auth_status_label.setText("❌ Не авторизован")
-            self.auth_status_label.setStyleSheet("color: red; font-weight: bold;")
-            self.auth_btn.setEnabled(True)
-            self.logout_btn.setEnabled(False)
-
-    def show_auth_dialog(self):
-        """Показывает диалог авторизации"""
-        dialog = AuthDialog(self)
-        dialog.authorization_success.connect(self.on_auth_success)
-        dialog.exec_()
-
-    def on_auth_success(self):
-        """Обработчик успешной авторизации"""
-        self.check_auth_status()
-        self.log_message("✅ Авторизация успешна!")
+            self.show_auth_dialog()
 
     def logout(self):
-        """Выход из аккаунта"""
+        """Выход из системы"""
         try:
             if os.path.exists(SESSION_FILE):
                 os.remove(SESSION_FILE)
-            self.check_auth_status()
-            self.log_message("✅ Выход выполнен успешно!")
+            self.auth_status_label.setText('🔐 Статус авторизации: Не авторизован')
+            self.auth_status_label.setStyleSheet('font-size: 12px; color: red;')
+            self.auth_button.setText('Авторизоваться')
+            QMessageBox.information(self, 'Выход', 'Вы успешно вышли из системы')
         except Exception as e:
-            self.log_message(f"❌ Ошибка выхода: {str(e)}")
+            QMessageBox.warning(self, 'Ошибка', f'Ошибка при выходе: {str(e)}')
+
+    def show_auth_dialog(self):
+        auth_dialog = AuthDialog(self)
+        auth_dialog.authorization_success.connect(self.on_auth_success)
+        auth_dialog.exec_()
+
+    def on_auth_success(self):
+        """Обработчик успешной авторизации"""
+        self.check_auth()  # Обновляем статус
+        QMessageBox.information(self, 'Успех', 'Авторизация прошла успешно!')
 
     def load_settings(self):
-        """Загружает настройки"""
         settings = SettingsManager.load_settings()
         self.daily_limit_spin.setValue(settings['daily_limit'])
         self.min_delay_spin.setValue(settings['min_delay'])
         self.max_delay_spin.setValue(settings['max_delay'])
 
     def save_settings(self):
-        """Сохраняет настройки"""
         settings = {
             'daily_limit': self.daily_limit_spin.value(),
             'min_delay': self.min_delay_spin.value(),
@@ -1366,84 +1381,113 @@ class CommentsMainWindow(QMainWindow):
         }
 
         if SettingsManager.save_settings(settings):
-            self.log_message("✅ Настройки сохранены!")
+            QMessageBox.information(self, 'Успех', 'Настройки сохранены!')
         else:
-            self.log_message("❌ Ошибка сохранения настроек!")
+            QMessageBox.warning(self, 'Ошибка', 'Не удалось сохранить настройки')
 
     def load_chats(self):
-        """Загружает список чатов"""
+        self.chats_data = CommentsManager.load_chats()
+        self.update_chats_list()
+        self.update_stats()
+
+    def update_chats_list(self):
         self.chats_list.clear()
-        chats = CommentsManager.load_chats()
 
-        total_chats = len(chats)
-        selected_count = 0
-        sent_count = sum(1 for chat in chats.values() if chat['status'] == 'отправлено')
-        today_sent = CommentsManager.get_today_sent_count()
+        filter_text = self.filter_combo.currentText()
 
-        for chat_id, chat_data in chats.items():
-            title = chat_data['title']
-            chat_type = chat_data['type']
-            access_type = chat_data['access_type']
-            can_comment = chat_data['can_comment']
-            can_video = chat_data['can_video']
-            status = chat_data['status']
-            last_post_date = chat_data.get('last_post_date', '')
-            username = chat_data.get('username', '')
+        for chat_id, data in self.chats_data.items():
+            title = data['title']
+            chat_type = data['type']
+            access_type = data['access_type']
+            can_comment = data['can_comment']
+            can_video = data['can_video']
+            status = data['status']
+            send_time = data.get('send_time', '')
+            username = data.get('username', '')
 
-            item_text = f"{title} [{chat_type}]"
-            if username:
-                item_text += f" (@{username})"
-            item_text += f" - {access_type}"
+            # Применяем фильтр
+            if filter_text == 'Не отправлено' and status != 'не отправлено':
+                continue
+            elif filter_text == 'Отправлено' and status != 'отправлено':
+                continue
+            elif filter_text == 'С видео' and not can_video:
+                continue
+            elif filter_text == 'Без видео' and can_video:
+                continue
 
-            if can_comment:
-                item_text += " 💬"
+            item_text = f"{title} | {chat_type} | {access_type} | "
             if can_video:
-                item_text += " 🎥"
+                item_text += "📹 | "
+            else:
+                item_text += "💬 | "
 
-            item_text += f" | {status}"
-            if last_post_date:
-                item_text += f" | пост: {last_post_date}"
+            item_text += f"Статус: {status}"
+
+            if send_time:
+                item_text += f" | {send_time}"
 
             item = QListWidgetItem(item_text)
             item.setData(Qt.UserRole, chat_id)
 
-            # Цветовая маркировка статуса
             if status == 'отправлено':
                 item.setBackground(Qt.green)
-            elif status == 'ошибка':
-                item.setBackground(Qt.red)
             elif status == 'не отправлено':
                 item.setBackground(Qt.yellow)
 
+            if can_comment:
+                item.setCheckState(Qt.Unchecked)
+            else:
+                item.setFlags(item.flags() & ~Qt.ItemIsEnabled)
+
             self.chats_list.addItem(item)
 
-        self.update_stats(total_chats, selected_count, sent_count, today_sent)
+    def filter_chats(self):
+        self.update_chats_list()
 
-    def update_stats(self, total, selected, sent, today_sent):
-        """Обновляет статистику"""
+    def toggle_select_all(self, state):
+        for i in range(self.chats_list.count()):
+            item = self.chats_list.item(i)
+            if item.flags() & Qt.ItemIsEnabled:
+                item.setCheckState(Qt.Checked if state else Qt.Unchecked)
+
+    def on_chat_item_changed(self, item):
+        # Обновляем статистику при изменении выбора
+        self.update_stats()
+
+    def get_selected_chats(self):
+        selected_chats = []
+        for i in range(self.chats_list.count()):
+            item = self.chats_list.item(i)
+            if item.checkState() == Qt.Checked:
+                chat_id = item.data(Qt.UserRole)
+                selected_chats.append(chat_id)
+        return selected_chats
+
+    def update_stats(self):
+        total = len(self.chats_data)
+        unsent = sum(1 for data in self.chats_data.values() if data['status'] == 'не отправлено')
+        sent = sum(1 for data in self.chats_data.values() if data['status'] == 'отправлено')
+        today_sent = CommentsManager.get_today_sent_count()
+        selected = len(self.get_selected_chats())
+
         self.stats_label.setText(
-            f"Статистика: всего {total}, выбрано {selected}, отправлено {sent}, сегодня {today_sent}/{self.daily_limit_spin.value()}"
-        )
+            f'Всего: {total} | Не отправлено: {unsent} | Отправлено: {sent} | Сегодня: {today_sent} | Выбрано: {selected}')
 
-    def log_message(self, message):
-        """Добавляет сообщение в лог"""
-        timestamp = datetime.now().strftime('%H:%M:%S')
-        self.log_text.append(f"[{timestamp}] {message}")
-        self.log_text.verticalScrollBar().setValue(
-            self.log_text.verticalScrollBar().maximum()
-        )
-
-    def start_search(self):
-        """Запускает поиск чатов"""
-        if not os.path.exists(SESSION_FILE):
+    def search_comments_chats(self):
+        # Сначала проверяем авторизацию
+        if not self.check_auth():
             QMessageBox.warning(self, 'Ошибка', 'Сначала авторизуйтесь!')
             return
 
         search_query = self.search_edit.text().strip()
         limit = self.limit_spin.value()
 
-        self.search_btn.setEnabled(False)
-        self.progress_label.setText("🔍 Поиск запущен...")
+        if not search_query:
+            QMessageBox.warning(self, 'Ошибка', 'Введите поисковый запрос')
+            return
+
+        self.search_button.setEnabled(False)
+        self.search_progress_label.setText('🔍 Начинаем поиск каналов с комментариями...')
 
         self.search_thread = CommentsSearchThread(search_query, limit)
         self.search_thread.progress.connect(self.on_search_progress)
@@ -1452,138 +1496,116 @@ class CommentsMainWindow(QMainWindow):
         self.search_thread.start()
 
     def on_search_progress(self, message):
-        """Обработчик прогресса поиска"""
-        self.progress_label.setText(message)
-        self.log_message(message)
+        self.search_progress_label.setText(message)
 
     def on_search_finished(self, found_chats):
-        """Обработчик завершения поиска"""
         if found_chats:
             if CommentsManager.add_chats(found_chats):
                 self.load_chats()
-                self.log_message(f"✅ Найдено и добавлено {len(found_chats)} чатов с комментариями!")
+                self.search_progress_label.setText(
+                    f'✅ Найдено и добавлено {len(found_chats)} чатов с комментариями')
+                QMessageBox.information(self, 'Успех',
+                                        f'Найдено и добавлено {len(found_chats)} чатов с комментариями!')
             else:
-                self.log_message("❌ Ошибка сохранения найденных чатов!")
+                self.search_progress_label.setText('❌ Ошибка сохранения чатов')
+                QMessageBox.warning(self, 'Ошибка', 'Не удалось сохранить найденные чаты')
         else:
-            self.log_message("❌ Чаты с комментариями не найдены!")
+            self.search_progress_label.setText('❌ Чаты с комментариями не найдены')
+            QMessageBox.information(self, 'Информация', 'Чаты с комментариями не найдены')
 
-        self.search_btn.setEnabled(True)
-        self.progress_label.setText("Поиск завершен")
+        self.search_button.setEnabled(True)
 
     def on_search_error(self, error_message):
-        """Обработчик ошибки поиска"""
-        self.log_message(f"❌ Ошибка поиска: {error_message}")
-        self.search_btn.setEnabled(True)
-        self.progress_label.setText("Ошибка поиска")
-
-    def leave_unused_chats(self):
-        """Выход из неиспользуемых чатов"""
-        if not os.path.exists(SESSION_FILE):
-            QMessageBox.warning(self, 'Ошибка', 'Сначала авторизуйтесь!')
-            return
-
-        chats = CommentsManager.load_chats()
-        chat_ids_to_keep = list(chats.keys())
-
-        reply = QMessageBox.question(
-            self, 'Подтверждение',
-            f'Вы уверены, что хотите выйти из всех чатов, кроме {len(chat_ids_to_keep)} сохраненных?',
-            QMessageBox.Yes | QMessageBox.No
-        )
-
-        if reply == QMessageBox.Yes:
-            self.leave_chats_btn.setEnabled(False)
-            self.log_message("🚪 Начинаем выход из неиспользуемых чатов...")
-
-            self.leave_thread = LeaveChatsThread(chat_ids_to_keep)
-            self.leave_thread.progress.connect(self.log_message)
-            self.leave_thread.finished.connect(self.on_leave_finished)
-            self.leave_thread.error.connect(self.on_leave_error)
-            self.leave_thread.start()
-
-    def on_leave_finished(self, count):
-        """Обработчик завершения выхода из чатов"""
-        self.log_message(f"✅ Выход из {count} чатов завершен!")
-        self.leave_chats_btn.setEnabled(True)
-
-    def on_leave_error(self, error_message):
-        """Обработчик ошибки выхода из чатов"""
-        self.log_message(f"❌ Ошибка выхода из чатов: {error_message}")
-        self.leave_chats_btn.setEnabled(True)
+        self.search_progress_label.setText(f'❌ Ошибка поиска: {error_message}')
+        QMessageBox.critical(self, 'Ошибка поиска', error_message)
+        self.search_button.setEnabled(True)
 
     def delete_selected_chats(self):
-        """Удаляет выбранные чаты из списка"""
         selected_items = self.chats_list.selectedItems()
         if not selected_items:
-            QMessageBox.warning(self, 'Ошибка', 'Выберите чаты для удаления!')
+            QMessageBox.warning(self, 'Ошибка', 'Выберите чаты для удаления')
             return
 
         chat_ids = [item.data(Qt.UserRole) for item in selected_items]
 
-        reply = QMessageBox.question(
-            self, 'Подтверждение',
-            f'Вы уверены, что хотите удалить {len(chat_ids)} чатов из списка?',
-            QMessageBox.Yes | QMessageBox.No
-        )
+        reply = QMessageBox.question(self, 'Подтверждение',
+                                     f'Вы уверены, что хотите удалить {len(chat_ids)} чатов?',
+                                     QMessageBox.Yes | QMessageBox.No)
 
         if reply == QMessageBox.Yes:
             if CommentsManager.delete_chats(chat_ids):
                 self.load_chats()
-                self.log_message(f"✅ Удалено {len(chat_ids)} чатов из списка!")
+                QMessageBox.information(self, 'Успех', f'Удалено {len(chat_ids)} чатов')
             else:
-                self.log_message("❌ Ошибка удаления чатов!")
+                QMessageBox.warning(self, 'Ошибка', 'Не удалось удалить чаты')
 
-    def select_all_chats(self):
-        """Выбирает все чаты в списке"""
-        for i in range(self.chats_list.count()):
-            item = self.chats_list.item(i)
-            item.setSelected(True)
+    def leave_unused_chats(self):
+        # Сначала проверяем авторизацию
+        if not self.check_auth():
+            QMessageBox.warning(self, 'Ошибка', 'Сначала авторизуйтесь!')
+            return
 
-    def deselect_all_chats(self):
-        """Снимает выделение со всех чатов"""
-        for i in range(self.chats_list.count()):
-            item = self.chats_list.item(i)
-            item.setSelected(False)
+        chat_ids_to_keep = list(self.chats_data.keys())
+
+        if not chat_ids_to_keep:
+            QMessageBox.warning(self, 'Ошибка', 'Нет чатов для сохранения')
+            return
+
+        reply = QMessageBox.question(self, 'Подтверждение',
+                                     'Вы уверены, что хотите выйти из всех чатов, кроме сохраненных в списке?',
+                                     QMessageBox.Yes | QMessageBox.No)
+
+        if reply == QMessageBox.Yes:
+            self.leave_thread = LeaveChatsThread(chat_ids_to_keep)
+            self.leave_thread.progress.connect(self.on_leave_progress)
+            self.leave_thread.finished.connect(self.on_leave_finished)
+            self.leave_thread.error.connect(self.on_leave_error)
+            self.leave_thread.start()
+
+    def on_leave_progress(self, message):
+        self.status_label.setText(message)
+
+    def on_leave_finished(self, count):
+        self.status_label.setText(f'✅ Выход завершен. Покинуто чатов: {count}')
+        QMessageBox.information(self, 'Успех', f'Выход завершен. Покинуто чатов: {count}')
+
+    def on_leave_error(self, error_message):
+        self.status_label.setText(f'❌ Ошибка выхода: {error_message}')
+        QMessageBox.critical(self, 'Ошибка', error_message)
 
     def browse_video(self):
-        """Открывает диалог выбора видеофайла"""
-        file_path, _ = QFileDialog.getOpenFileName(
-            self, "Выберите видеофайл", "",
-            "Video Files (*.mp4 *.avi *.mov *.mkv *.webm);;All Files (*)"
-        )
-
+        file_path, _ = QFileDialog.getOpenFileName(self, 'Выберите видеофайл', '',
+                                                   'Video Files (*.mp4 *.avi *.mov *.mkv)')
         if file_path:
             self.video_path_edit.setText(file_path)
 
     def send_test_comment(self):
-        """Отправляет тестовый комментарий"""
-        if not os.path.exists(SESSION_FILE):
+        # Сначала проверяем авторизацию
+        if not self.check_auth():
             QMessageBox.warning(self, 'Ошибка', 'Сначала авторизуйтесь!')
             return
 
-        selected_items = self.chats_list.selectedItems()
-        if not selected_items:
-            QMessageBox.warning(self, 'Ошибка', 'Выберите чат для тестового комментария!')
-            return
-
-        if len(selected_items) > 1:
-            QMessageBox.warning(self, 'Ошибка', 'Выберите только один чат для теста!')
+        selected_chats = self.get_selected_chats()
+        if not selected_chats:
+            QMessageBox.warning(self, 'Ошибка', 'Выберите хотя бы один чат для тестового комментария')
             return
 
         message = self.message_edit.toPlainText().strip()
         if not message:
-            QMessageBox.warning(self, 'Ошибка', 'Введите текст комментария!')
+            QMessageBox.warning(self, 'Ошибка', 'Введите текст комментария')
             return
 
-        chat_id = selected_items[0].data(Qt.UserRole)
-        video_path = self.video_path_edit.text().strip() if self.video_check.isChecked() else None
-
-        if self.video_check.isChecked() and (not video_path or not os.path.exists(video_path)):
-            QMessageBox.warning(self, 'Ошибка', 'Видеофайл не найден!')
+        video_path = self.video_path_edit.text().strip()
+        if video_path and not os.path.exists(video_path):
+            QMessageBox.warning(self, 'Ошибка', 'Указанный видеофайл не существует')
             return
 
-        self.test_send_btn.setEnabled(False)
-        self.log_message("🧪 Отправляем тестовый комментарий...")
+        # Отправляем в первый выбранный чат
+        chat_id = selected_chats[0]
+        chat_info = self.chats_data.get(chat_id, {})
+        chat_title = chat_info.get('title', 'чат')
+
+        self.status_label.setText(f'📤 Отправляем тестовый комментарий в {chat_title}...')
 
         self.send_thread = SendCommentThread(chat_id, message, video_path)
         self.send_thread.finished.connect(self.on_send_finished)
@@ -1591,38 +1613,37 @@ class CommentsMainWindow(QMainWindow):
         self.send_thread.start()
 
     def on_send_finished(self, success, message):
-        """Обработчик завершения отправки"""
-        self.log_message(message)
-        self.test_send_btn.setEnabled(True)
-        self.load_chats()
+        self.status_label.setText(message)
+        if success:
+            QMessageBox.information(self, 'Успех', message)
+            self.load_chats()
+        else:
+            QMessageBox.warning(self, 'Предупреждение', message)
 
     def on_send_error(self, error_message):
-        """Обработчик ошибки отправки"""
-        self.log_message(f"❌ Ошибка отправки: {error_message}")
-        self.test_send_btn.setEnabled(True)
+        self.status_label.setText(f'❌ Ошибка: {error_message}')
+        QMessageBox.critical(self, 'Ошибка отправки', error_message)
 
-    def start_auto_send(self):
-        """Запускает автоматическую рассылку"""
-        if not os.path.exists(SESSION_FILE):
+    def start_auto_comments(self):
+        # Сначала проверяем авторизацию
+        if not self.check_auth():
             QMessageBox.warning(self, 'Ошибка', 'Сначала авторизуйтесь!')
             return
 
-        selected_items = self.chats_list.selectedItems()
-        if not selected_items:
-            QMessageBox.warning(self, 'Ошибка', 'Выберите чаты для рассылки!')
+        selected_chats = self.get_selected_chats()
+        if not selected_chats:
+            QMessageBox.warning(self, 'Ошибка', 'Выберите чаты для автоматических комментариев')
             return
 
         message = self.message_edit.toPlainText().strip()
         if not message:
-            QMessageBox.warning(self, 'Ошибка', 'Введите текст комментария!')
+            QMessageBox.warning(self, 'Ошибка', 'Введите текст комментария')
             return
 
-        video_path = self.video_path_edit.text().strip() if self.video_check.isChecked() else None
-        if self.video_check.isChecked() and (not video_path or not os.path.exists(video_path)):
-            QMessageBox.warning(self, 'Ошибка', 'Видеофайл не найден!')
+        video_path = self.video_path_edit.text().strip()
+        if video_path and not os.path.exists(video_path):
+            QMessageBox.warning(self, 'Ошибка', 'Указанный видеофайл не существует')
             return
-
-        chat_ids = [item.data(Qt.UserRole) for item in selected_items]
 
         settings = {
             'daily_limit': self.daily_limit_spin.value(),
@@ -1630,60 +1651,61 @@ class CommentsMainWindow(QMainWindow):
             'max_delay': self.max_delay_spin.value()
         }
 
-        self.auto_send_btn.setEnabled(False)
-        self.stop_send_btn.setEnabled(True)
-        self.send_progress.setValue(0)
+        self.status_label.setText('🚀 Запуск автоматической рассылки комментариев...')
+        self.progress_bar.setVisible(True)
+        self.start_auto_button.setEnabled(False)
+        self.stop_auto_button.setEnabled(True)
 
-        self.log_message("🚀 Запускаем автоматическую рассылку комментариев...")
-
-        self.auto_send_thread = AutoCommentsThread(
-            message, video_path, chat_ids,
-            settings['min_delay'], settings['max_delay'], settings['daily_limit']
+        self.auto_thread = AutoCommentsThread(
+            message=message,
+            video_path=video_path,
+            selected_chats=selected_chats,
+            min_delay=settings['min_delay'],
+            max_delay=settings['max_delay'],
+            daily_limit=settings['daily_limit']
         )
-        self.auto_send_thread.progress.connect(self.on_auto_send_progress)
-        self.auto_send_thread.finished.connect(self.on_auto_send_finished)
-        self.auto_send_thread.error.connect(self.on_auto_send_error)
-        self.auto_send_thread.start()
 
-    def on_auto_send_progress(self, message, current, total):
-        """Обработчик прогресса автоматической рассылки"""
-        self.send_status_label.setText(message)
-        self.log_message(message)
+        self.auto_thread.progress.connect(self.on_auto_progress)
+        self.auto_thread.finished.connect(self.on_auto_finished)
+        self.auto_thread.error.connect(self.on_auto_error)
+        self.auto_thread.start()
 
+    def on_auto_progress(self, message, current, total):
+        self.progress_label.setText(message)
         if total > 0:
-            progress = int((current / total) * 100)
-            self.send_progress.setValue(progress)
+            self.progress_bar.setMaximum(total)
+            self.progress_bar.setValue(current)
 
-    def on_auto_send_finished(self, message):
-        """Обработчик завершения автоматической рассылки"""
-        self.log_message(message)
-        self.send_status_label.setText("Рассылка завершена")
-        self.auto_send_btn.setEnabled(True)
-        self.stop_send_btn.setEnabled(False)
-        self.send_progress.setValue(100)
+    def on_auto_finished(self, message):
+        self.status_label.setText(message)
+        self.progress_bar.setVisible(False)
+        self.progress_label.setText('')
+        self.start_auto_button.setEnabled(True)
+        self.stop_auto_button.setEnabled(False)
         self.load_chats()
 
-    def on_auto_send_error(self, error_message):
-        """Обработчик ошибки автоматической рассылки"""
-        self.log_message(f"❌ Ошибка рассылки: {error_message}")
-        self.send_status_label.setText("Ошибка рассылки")
-        self.auto_send_btn.setEnabled(True)
-        self.stop_send_btn.setEnabled(False)
-        self.send_progress.setValue(0)
+        if "остановлена" not in message:
+            QMessageBox.information(self, 'Завершено', message)
 
-    def stop_auto_send(self):
-        """Останавливает автоматическую рассылку"""
-        if self.auto_send_thread and self.auto_send_thread.isRunning():
-            self.auto_send_thread.stop_sending()
-            self.log_message("⏹️ Останавливаем рассылку...")
-            self.stop_send_btn.setEnabled(False)
+    def on_auto_error(self, error_message):
+        self.status_label.setText(f'❌ Ошибка: {error_message}')
+        self.progress_bar.setVisible(False)
+        self.progress_label.setText('')
+        self.start_auto_button.setEnabled(True)
+        self.stop_auto_button.setEnabled(False)
+        QMessageBox.critical(self, 'Ошибка', error_message)
+
+    def stop_auto_comments(self):
+        if self.auto_thread and self.auto_thread.isRunning():
+            self.auto_thread.stop_sending()
+            self.status_label.setText('⏹️ Останавливаем рассылку...')
 
 
 def main():
     app = QApplication(sys.argv)
-    app.setApplicationName("Telegram Comments Bot")
+    app.setApplicationName('Telegram Comments Sender')
 
-    window = CommentsMainWindow()
+    window = CommentsSenderApp()
     window.show()
 
     sys.exit(app.exec_())
