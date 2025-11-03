@@ -7,8 +7,9 @@ from telethon import TelegramClient
 from telethon.errors import SessionPasswordNeededError, FloodWaitError, ChatWriteForbiddenError, ChannelPrivateError, \
     InviteRequestSentError, UserAlreadyParticipantError
 from telethon.tl.functions.messages import GetDialogsRequest, ImportChatInviteRequest, GetDiscussionMessageRequest
-from telethon.tl.functions.channels import JoinChannelRequest, LeaveChannelRequest, GetFullChannelRequest
-from telethon.tl.types import InputPeerEmpty, Channel, ChatForbidden, Message
+from telethon.tl.functions.channels import JoinChannelRequest, LeaveChannelRequest, GetFullChannelRequest, \
+    GetGroupsForDiscussionRequest
+from telethon.tl.types import InputPeerEmpty, Channel, ChatForbidden, Message, Chat, User
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QVBoxLayout,
                              QHBoxLayout, QWidget, QComboBox, QTextEdit,
                              QPushButton, QLabel, QMessageBox, QLineEdit,
@@ -479,7 +480,7 @@ class CommentsSearchThread(QThread):
                 loop.close()
 
     async def search_comments_chats(self, client):
-        """Поиск каналов и групп с возможностью комментирования"""
+        """Улучшенный поиск каналов и групп с возможностью комментирования"""
         found_chats = {}
         count = 0
 
@@ -491,20 +492,23 @@ class CommentsSearchThread(QThread):
                 await client.disconnect()
                 raise Exception("Пользователь не авторизован")
 
-            self.progress.emit("🔍 Начинаем поиск каналов с комментариями...")
+            self.progress.emit("🔍 Начинаем расширенный поиск каналов и групп...")
 
-            # Получаем диалоги
-            dialogs = await client.get_dialogs(limit=100)
+            # Метод 1: Поиск через диалоги
+            self.progress.emit("📂 Ищем в ваших диалогах...")
+            dialogs = await client.get_dialogs(limit=150)
 
             for dialog in dialogs:
                 if count >= self.limit:
                     break
 
-                if not dialog.is_channel:
+                entity = dialog.entity
+
+                # Пропускаем личные чаты
+                if isinstance(entity, User):
                     continue
 
-                entity = dialog.entity
-                chat_title = dialog.name.lower()
+                chat_title = getattr(entity, 'title', '').lower()
 
                 # Фильтрация по поисковому запросу
                 if self.search_query and self.search_query.lower() not in chat_title:
@@ -515,105 +519,97 @@ class CommentsSearchThread(QThread):
 
                     # Пропускаем чаты, которые уже есть в списке
                     if chat_id in existing_chats:
-                        self.progress.emit(f"⏭️ Пропускаем {dialog.name} - уже в списке")
                         continue
 
                     if chat_id in found_chats:
                         continue
 
-                    # Получаем полную информацию о канале
-                    full_chat = await client(GetFullChannelRequest(entity))
+                    # Определяем тип чата
+                    if isinstance(entity, Channel):
+                        if entity.broadcast:
+                            chat_type = "Канал"
+                        elif entity.megagroup:
+                            chat_type = "Супергруппа"
+                        else:
+                            chat_type = "Группа"
+                    else:
+                        chat_type = "Группа"
 
-                    # Проверяем, есть ли обсуждение (комментарии)
-                    has_comments = False
-                    last_post_id = 0
-                    last_post_date = ""
+                    # Проверяем возможность комментирования
                     can_comment = False
                     can_video = False
+                    last_post_id = 0
+                    last_post_date = ""
                     username = getattr(entity, 'username', '')
+                    access_type = "Закрытый"
 
-                    # Проверяем, включены ли комментарии
-                    if hasattr(full_chat, 'linked_chat_id') and full_chat.linked_chat_id:
-                        has_comments = True
+                    # Пробуем вступить в открытые чаты
+                    if username:
+                        try:
+                            await client(JoinChannelRequest(username))
+                            access_type = "Открытый"
+                        except UserAlreadyParticipantError:
+                            access_type = "Уже участник"
+                        except Exception:
+                            access_type = "Закрытый"
 
-                        # Получаем последние сообщения для поиска поста для комментирования
-                        messages = await client.get_messages(entity, limit=10)
+                    # Получаем последние сообщения для проверки комментирования
+                    try:
+                        messages = await client.get_messages(entity, limit=5)
 
                         for message in messages:
-                            if not isinstance(message, Message) or message.message == '':
+                            if not message:
                                 continue
 
-                            # Проверяем, можно ли комментировать это сообщение
                             try:
-                                # Пробуем получить информацию об обсуждении
-                                if hasattr(message, 'id'):
-                                    # Пробуем отправить тестовый комментарий
-                                    try:
-                                        test_comment = await client.send_message(
-                                            entity,
-                                            "💬 Тестовый комментарий",
-                                            comment_to=message.id
-                                        )
-                                        await asyncio.sleep(1)
-                                        await client.delete_messages(entity, [test_comment.id])
-                                        can_comment = True
-                                        last_post_id = message.id
-                                        last_post_date = message.date.strftime('%d.%m.%Y %H:%M') if message.date else ""
+                                # Пробуем отправить тестовый комментарий
+                                test_comment = await client.send_message(
+                                    entity,
+                                    "💬 Тестовый комментарий",
+                                    comment_to=message.id
+                                )
+                                await asyncio.sleep(1)
+                                await client.delete_messages(entity, [test_comment.id])
 
-                                        # Проверяем возможность отправки видео в комментарии
+                                can_comment = True
+                                last_post_id = message.id
+                                last_post_date = message.date.strftime('%d.%m.%Y %H:%M') if message.date else ""
+
+                                # Проверяем возможность отправки видео
+                                try:
+                                    with tempfile.NamedTemporaryFile(suffix='.txt', delete=False) as f:
+                                        f.write(b"test video content")
+                                        test_file = f.name
+
+                                    test_video = await client.send_file(
+                                        entity,
+                                        test_file,
+                                        caption="Тест видео",
+                                        comment_to=message.id
+                                    )
+                                    await asyncio.sleep(1)
+                                    await client.delete_messages(entity, [test_video.id])
+                                    can_video = True
+                                    os.unlink(test_file)
+                                except Exception:
+                                    can_video = False
+                                    if os.path.exists(test_file):
                                         try:
-                                            with tempfile.NamedTemporaryFile(suffix='.txt', delete=False) as f:
-                                                f.write(b"test video content")
-                                                test_file = f.name
-
-                                            test_video = await client.send_file(
-                                                entity,
-                                                test_file,
-                                                caption="Тест видео в комментарии",
-                                                comment_to=message.id
-                                            )
-                                            await asyncio.sleep(1)
-                                            await client.delete_messages(entity, [test_video.id])
-                                            can_video = True
                                             os.unlink(test_file)
-                                        except Exception:
-                                            can_video = False
-                                            if os.path.exists(test_file):
-                                                try:
-                                                    os.unlink(test_file)
-                                                except:
-                                                    pass
+                                        except:
+                                            pass
 
-                                        break  # Нашли подходящий пост, выходим
-
-                                    except Exception as e:
-                                        continue
+                                break  # Нашли рабочий пост
 
                             except Exception as e:
                                 continue
 
-                    # Определяем тип чата
-                    if hasattr(entity, 'broadcast') and entity.broadcast:
-                        chat_type = "Канал"
-                    elif hasattr(entity, 'megagroup') and entity.megagroup:
-                        chat_type = "Супергруппа"
-                    else:
-                        chat_type = "Группа"
+                    except Exception as e:
+                        self.progress.emit(f"⚠️ Не удалось проверить {dialog.name}: {str(e)}")
+                        continue
 
-                    # Пробуем вступить в чат
-                    access_type = "Закрытый"
-                    try:
-                        if hasattr(entity, 'username') and entity.username:
-                            try:
-                                await client(JoinChannelRequest(entity.username))
-                                access_type = "Открытый"
-                            except UserAlreadyParticipantError:
-                                access_type = "Уже участник"
-                    except Exception:
-                        pass
-
-                    # Сохраняем найденный чат
-                    if has_comments and can_comment:
+                    # Сохраняем чат если можно комментировать
+                    if can_comment:
                         found_chats[chat_id] = {
                             'title': dialog.name,
                             'type': chat_type,
@@ -627,55 +623,145 @@ class CommentsSearchThread(QThread):
                             'username': username
                         }
                         count += 1
-                        self.progress.emit(f"💬 Найден: {count} - {dialog.name} (пост от {last_post_date})")
+                        self.progress.emit(f"💬 Найден: {count} - {dialog.name}")
 
                 except Exception as e:
                     continue
 
-            # Дополнительный поиск в популярных каналах с комментариями
-            popular_comment_channels = [
-                '@tgraphio', '@rednotes', '@breakingmash',
-                '@rian_ru', '@meduzaproject', '@bbcrussian'
-            ]
+            # Метод 2: Глобальный поиск
+            if count < self.limit:
+                self.progress.emit("🌐 Запускаем глобальный поиск...")
 
-            for channel in popular_comment_channels:
-                if count >= self.limit:
-                    break
+                # Популярные каналы для поиска
+                search_queries = [
+                    self.search_query,
+                    'новости', 'технологии', 'политика', 'спорт',
+                    'экономика', 'культура', 'образование', 'наука'
+                ]
 
-                try:
-                    entity = await client.get_entity(channel)
-                    chat_id = str(entity.id)
+                for query in search_queries:
+                    if count >= self.limit:
+                        break
 
-                    if chat_id in existing_chats or chat_id in found_chats:
+                    if not query:
                         continue
 
-                    # Проверяем наличие комментариев
-                    full_chat = await client(GetFullChannelRequest(entity))
-                    has_comments = hasattr(full_chat, 'linked_chat_id') and full_chat.linked_chat_id
+                    try:
+                        self.progress.emit(f"🔎 Ищем по запросу: {query}")
+                        search_results = await client.get_dialogs()
 
-                    if has_comments:
-                        # Аналогичная проверка возможности комментирования
-                        messages = await client.get_messages(entity, limit=5)
+                        # Также используем поиск по каналам
+                        try:
+                            found_entities = await client.get_participants(query, limit=20)
+                        except:
+                            found_entities = []
+
+                        all_entities = list(search_results) + list(found_entities)
+
+                        for entity in all_entities:
+                            if count >= self.limit:
+                                break
+
+                            if hasattr(entity, 'title'):
+                                chat_title = entity.title.lower()
+                                if self.search_query and self.search_query.lower() not in chat_title:
+                                    continue
+
+                                try:
+                                    chat_id = str(entity.id)
+
+                                    if chat_id in existing_chats or chat_id in found_chats:
+                                        continue
+
+                                    # Проверяем возможность комментирования (аналогично первому методу)
+                                    can_comment = False
+                                    last_post_id = 0
+
+                                    try:
+                                        messages = await client.get_messages(entity, limit=3)
+                                        for message in messages:
+                                            try:
+                                                test_comment = await client.send_message(
+                                                    entity,
+                                                    "💬 Тест",
+                                                    comment_to=message.id
+                                                )
+                                                await asyncio.sleep(1)
+                                                await client.delete_messages(entity, [test_comment.id])
+                                                can_comment = True
+                                                last_post_id = message.id
+                                                break
+                                            except:
+                                                continue
+                                    except:
+                                        pass
+
+                                    if can_comment:
+                                        found_chats[chat_id] = {
+                                            'title': entity.title,
+                                            'type': "Канал",
+                                            'access_type': "Открытый",
+                                            'can_comment': can_comment,
+                                            'can_video': False,
+                                            'last_post_id': last_post_id,
+                                            'last_post_date': datetime.now().strftime('%d.%m.%Y %H:%M'),
+                                            'status': 'не отправлено',
+                                            'send_time': '',
+                                            'username': getattr(entity, 'username', '')
+                                        }
+                                        count += 1
+                                        self.progress.emit(f"🌐 Найден: {count} - {entity.title}")
+
+                                except Exception as e:
+                                    continue
+
+                    except Exception as e:
+                        self.progress.emit(f"⚠️ Ошибка поиска '{query}': {str(e)}")
+                        continue
+
+            # Метод 3: Поиск в популярных каналах
+            if count < self.limit:
+                self.progress.emit("📢 Проверяем популярные каналы...")
+
+                popular_channels = [
+                    'tgraphio', 'rednotes', 'breakingmash', 'rian_ru',
+                    'meduzaproject', 'bbcrussian', 'rt_russian', 'lentach',
+                    'tass_agency', 'rian_ru', 'rbc_news'
+                ]
+
+                for channel in popular_channels:
+                    if count >= self.limit:
+                        break
+
+                    try:
+                        entity = await client.get_entity(channel)
+                        chat_id = str(entity.id)
+
+                        if chat_id in existing_chats or chat_id in found_chats:
+                            continue
+
+                        # Проверяем комментирование
                         can_comment = False
                         last_post_id = 0
-                        last_post_date = ""
-                        can_video = False
 
-                        for message in messages:
-                            try:
-                                test_comment = await client.send_message(
-                                    entity,
-                                    "💬 Тест",
-                                    comment_to=message.id
-                                )
-                                await asyncio.sleep(1)
-                                await client.delete_messages(entity, [test_comment.id])
-                                can_comment = True
-                                last_post_id = message.id
-                                last_post_date = message.date.strftime('%d.%m.%Y %H:%M') if message.date else ""
-                                break
-                            except:
-                                continue
+                        try:
+                            messages = await client.get_messages(entity, limit=3)
+                            for message in messages:
+                                try:
+                                    test_comment = await client.send_message(
+                                        entity,
+                                        "💬 Тест",
+                                        comment_to=message.id
+                                    )
+                                    await asyncio.sleep(1)
+                                    await client.delete_messages(entity, [test_comment.id])
+                                    can_comment = True
+                                    last_post_id = message.id
+                                    break
+                                except:
+                                    continue
+                        except:
+                            pass
 
                         if can_comment:
                             found_chats[chat_id] = {
@@ -683,9 +769,9 @@ class CommentsSearchThread(QThread):
                                 'type': "Канал",
                                 'access_type': "Открытый",
                                 'can_comment': can_comment,
-                                'can_video': can_video,
+                                'can_video': False,
                                 'last_post_id': last_post_id,
-                                'last_post_date': last_post_date,
+                                'last_post_date': datetime.now().strftime('%d.%m.%Y %H:%M'),
                                 'status': 'не отправлено',
                                 'send_time': '',
                                 'username': channel
@@ -693,15 +779,15 @@ class CommentsSearchThread(QThread):
                             count += 1
                             self.progress.emit(f"📢 Найден: {count} - {channel}")
 
-                except Exception as e:
-                    continue
+                    except Exception as e:
+                        continue
 
             await client.disconnect()
 
             if not found_chats:
-                self.progress.emit("❌ Каналы с комментариями не найдены. Попробуйте другой запрос.")
+                self.progress.emit("❌ Чаты с комментариями не найдены. Попробуйте другой запрос.")
             else:
-                self.progress.emit(f"🎯 Поиск завершен. Найдено каналов с комментариями: {len(found_chats)}")
+                self.progress.emit(f"🎯 Поиск завершен. Найдено чатов: {len(found_chats)}")
 
             return found_chats
 
