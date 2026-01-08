@@ -7,7 +7,7 @@ from telethon import TelegramClient
 from telethon.errors import SessionPasswordNeededError, FloodWaitError, ChatWriteForbiddenError, ChannelPrivateError, \
     InviteRequestSentError, UserAlreadyParticipantError
 from telethon.tl.functions.messages import GetDialogsRequest, ImportChatInviteRequest, GetDiscussionMessageRequest, \
-    SearchRequest
+    SearchRequest, GetDialogFiltersRequest
 from telethon.tl.functions.channels import JoinChannelRequest, LeaveChannelRequest, GetFullChannelRequest, \
     GetChannelsRequest
 from telethon.tl.types import InputPeerEmpty, Channel, ChatForbidden, Message, Chat, User, InputMessagesFilterEmpty, \
@@ -30,6 +30,73 @@ SESSION_FILE = os.path.join(tempfile.gettempdir(), 'telegram_session')
 COMMENTS_FILE = 'comments_chats_list.txt'
 SETTINGS_FILE = 'comments_settings.txt'
 FOLDERS_FILE = 'telegram_folders.json'
+
+
+def clean_text(text):
+    """Очищает текст от проблемных символов, но сохраняет смайлы/эмодзи"""
+    if not text:
+        return text
+
+    # Убираем нулевые символы и другие непечатаемые символы, кроме эмодзи
+    # Сохраняем эмодзи (символы из диапазонов эмодзи)
+    cleaned = []
+    for char in text:
+        code = ord(char)
+        # Сохраняем:
+        # - обычные печатные символы (32-126)
+        # - кириллицу (1040-1103 и 1025, 1105)
+        # - эмодзи (диапазоны 0x1F600-0x1F64F, 0x1F300-0x1F5FF, 0x1F680-0x1F6FF, 0x1F700-0x1F77F,
+        #           0x1F780-0x1F7FF, 0x1F800-0x1F8FF, 0x1F900-0x1F9FF, 0x1FA00-0x1FA6F,
+        #           0x1FA70-0x1FAFF, 0x02700-0x027BF, 0x1F1E6-0x1F1FF и т.д.)
+        if (32 <= code <= 126 or  # ASCII печатные символы
+                1040 <= code <= 1103 or  # Кириллица
+                code in [1025, 1105] or  # Ё/ё
+                0x1F600 <= code <= 0x1F64F or  # Эмодзи лица
+                0x1F300 <= code <= 0x1F5FF or  # Символы и пиктограммы
+                0x1F680 <= code <= 0x1F6FF or  # Транспорт и карты
+                0x1F700 <= code <= 0x1F77F or  # Астрономические
+                0x1F780 <= code <= 0x1F7FF or  # Геометрические
+                0x1F800 <= code <= 0x1F8FF or  # Дополнительные стрелки
+                0x1F900 <= code <= 0x1F9FF or  # Дополнительные символы
+                0x1FA00 <= code <= 0x1FA6F or  # Шахматы
+                0x1FA70 <= code <= 0x1FAFF or  # Дополнительные символы
+                0x02700 <= code <= 0x027BF or  # Символы Dingbat
+                0x1F1E6 <= code <= 0x1F1FF):  # Флаги
+            cleaned.append(char)
+        elif char == '\n' or char == '\r' or char == '\t':  # Сохраняем переносы строк и табуляцию
+            cleaned.append(char)
+        elif code < 32:  # Удаляем непечатаемые управляющие символы
+            continue
+        else:
+            # Для остальных символов пробуем заменить на похожие или оставить
+            # Многие смайлы из Windows (Wingdings и т.д.) могут быть здесь
+            cleaned.append(char)
+
+    result = ''.join(cleaned)
+
+    # Убираем множественные пробелы
+    result = re.sub(r'\s+', ' ', result).strip()
+
+    return result
+
+
+def encode_text_for_saving(text):
+    """Кодирует текст для сохранения в файл"""
+    if not text:
+        return ""
+    # Заменяем запятые на специальный символ, чтобы не путать с разделителями CSV
+    text = text.replace(',', '‚')  # Используем одинарную нижнюю кавычку
+    text = text.replace('\n', '↵')  # Заменяем переносы строк
+    return text
+
+
+def decode_text_from_saved(text):
+    """Декодирует текст из сохраненного формата"""
+    if not text:
+        return ""
+    text = text.replace('‚', ',')  # Возвращаем запятые
+    text = text.replace('↵', '\n')  # Возвращаем переносы строк
+    return text
 
 
 class SettingsManager:
@@ -108,9 +175,11 @@ class LoadFoldersThread(QThread):
     progress = pyqtSignal(str)
     error = pyqtSignal(str)
 
-    def __init__(self):
+    def __init__(self, phone=None):
         super().__init__()
         self.client = None
+        self.phone = phone
+        self.session_file = f"{SESSION_FILE}_{phone.replace('+', '')}" if phone else SESSION_FILE
 
     def run(self):
         loop = None
@@ -118,7 +187,7 @@ class LoadFoldersThread(QThread):
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
 
-            self.client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
+            self.client = TelegramClient(self.session_file, API_ID, API_HASH)
             result = loop.run_until_complete(self.load_telegram_folders())
             self.finished.emit(result)
 
@@ -138,51 +207,88 @@ class LoadFoldersThread(QThread):
 
             self.progress.emit("📁 Загружаем папки из Telegram...")
 
-            # Получаем все диалоги включая папки
-            dialogs = await self.client.get_dialogs()
-
-            # Собираем информацию о папках
+            # Получаем все фильтры (папки)
             folders = {}
 
-            for dialog in dialogs:
-                if isinstance(dialog, DialogFolder):
-                    # Это папка
-                    folder_title = dialog.folder.title
-                    folder_id = dialog.folder.id
+            try:
+                # Получаем фильтры (папки)
+                filters = await self.client(GetDialogFiltersRequest())
 
-                    self.progress.emit(f"📂 Найдена папка: {folder_title}")
-
-                    # Получаем чаты из этой папки
-                    folder_chats = []
+                for i, filter_obj in enumerate(filters):
                     try:
-                        # Получаем детальную информацию о папке
-                        folder_dialogs = await self.client.get_dialogs(folder=dialog.folder)
-                        for folder_dialog in folder_dialogs:
-                            if hasattr(folder_dialog.entity, 'id'):
-                                folder_chats.append(str(folder_dialog.entity.id))
-                                self.progress.emit(f"   💬 Добавлен чат: {folder_dialog.name}")
+                        if hasattr(filter_obj, 'title') and filter_obj.title:
+                            folder_title = clean_text(filter_obj.title)  # Очищаем название папки
+
+                            # Собираем ID чатов из фильтра
+                            chat_ids = []
+
+                            # Получаем включенные чаты
+                            if hasattr(filter_obj, 'include_peers'):
+                                for peer in filter_obj.include_peers:
+                                    if hasattr(peer, 'channel_id'):
+                                        chat_ids.append(str(peer.channel_id))
+                                    elif hasattr(peer, 'chat_id'):
+                                        chat_ids.append(str(peer.chat_id))
+                                    elif hasattr(peer, 'user_id'):
+                                        # Пропускаем пользователей
+                                        continue
+
+                            # Также проверяем pinned_peers
+                            if hasattr(filter_obj, 'pinned_peers'):
+                                for peer in filter_obj.pinned_peers:
+                                    if hasattr(peer, 'channel_id'):
+                                        chat_id = str(peer.channel_id)
+                                        if chat_id not in chat_ids:
+                                            chat_ids.append(chat_id)
+                                    elif hasattr(peer, 'chat_id'):
+                                        chat_id = str(peer.chat_id)
+                                        if chat_id not in chat_ids:
+                                            chat_ids.append(chat_id)
+
+                            if chat_ids:
+                                folders[folder_title] = chat_ids
+                                self.progress.emit(f"📂 Найдена папка: '{folder_title}' с {len(chat_ids)} чатами")
+                            else:
+                                folders[folder_title] = []
+                                self.progress.emit(f"📂 Найдена пустая папка: '{folder_title}'")
                     except Exception as e:
-                        self.progress.emit(f"⚠️ Ошибка загрузки чатов из папки {folder_title}: {str(e)}")
+                        self.progress.emit(f"⚠️ Ошибка обработки папки: {str(e)}")
+                        continue
 
-                    folders[folder_title] = folder_chats
-                    self.progress.emit(f"✅ Папка '{folder_title}' содержит {len(folder_chats)} чатов")
+            except Exception as e:
+                self.progress.emit(f"⚠️ Ошибка получения папок: {str(e)}")
 
-            # Также добавляем папку "Все диалоги" (основные диалоги не в папках)
-            main_dialogs = []
-            for dialog in dialogs:
-                if (not isinstance(dialog, DialogFolder) and
-                        hasattr(dialog, 'entity') and
-                        hasattr(dialog.entity, 'id') and
-                        (isinstance(dialog.entity, Channel) or isinstance(dialog.entity, Chat))):
-                    main_dialogs.append(str(dialog.entity.id))
-
-            if main_dialogs:
-                folders["Все диалоги"] = main_dialogs
-                self.progress.emit(f"✅ Папка 'Все диалоги' содержит {len(main_dialogs)} чатов")
-
+            # Если папок нет, создаем "Все диалоги"
             if not folders:
                 self.progress.emit("ℹ️ Папки не найдены. Создайте папки в Telegram и добавьте в них чаты.")
-                folders = {"Все диалоги": main_dialogs} if main_dialogs else {}
+
+                # Получаем все группы и каналы для папки "Все диалоги"
+                dialogs = await self.client.get_dialogs(limit=100)
+                all_chats = []
+
+                for dialog in dialogs:
+                    if hasattr(dialog, 'entity') and hasattr(dialog.entity, 'id'):
+                        if isinstance(dialog.entity, Channel) or isinstance(dialog.entity, Chat):
+                            chat_id = str(dialog.entity.id)
+                            all_chats.append(chat_id)
+
+                if all_chats:
+                    folders["Все диалоги"] = all_chats
+                    self.progress.emit(f"✅ Создана папка 'Все диалоги' с {len(all_chats)} чатами")
+            else:
+                # Добавляем "Все диалоги" как отдельную папку
+                dialogs = await self.client.get_dialogs(limit=100)
+                all_chats = []
+
+                for dialog in dialogs:
+                    if hasattr(dialog, 'entity') and hasattr(dialog.entity, 'id'):
+                        if isinstance(dialog.entity, Channel) or isinstance(dialog.entity, Chat):
+                            chat_id = str(dialog.entity.id)
+                            all_chats.append(chat_id)
+
+                if all_chats:
+                    folders["Все диалоги"] = all_chats
+                    self.progress.emit(f"✅ Добавлена папка 'Все диалоги' с {len(all_chats)} чатами")
 
             # Сохраняем найденные папки
             FoldersManager.save_folders(folders)
@@ -213,19 +319,19 @@ class CommentsManager:
                             parts = line.split(',')
                             if len(parts) >= 9:
                                 chat_id = parts[0]
-                                chat_title = parts[1]
-                                chat_type = parts[2]
-                                access_type = parts[3]
-                                can_comment = parts[4] == 'True'
-                                can_video = parts[5] == 'True'
-                                last_post_id = parts[6]
-                                last_post_date = parts[7]
+                                chat_title = decode_text_from_saved(parts[1]) if len(parts) > 1 else ''
+                                chat_type = parts[2] if len(parts) > 2 else ''
+                                access_type = parts[3] if len(parts) > 3 else ''
+                                can_comment = parts[4] == 'True' if len(parts) > 4 else False
+                                can_video = parts[5] == 'True' if len(parts) > 5 else False
+                                last_post_id = parts[6] if len(parts) > 6 else '0'
+                                last_post_date = parts[7] if len(parts) > 7 else ''
                                 status = parts[8] if len(parts) > 8 else 'не отправлено'
                                 send_time = parts[9] if len(parts) > 9 else ''
                                 username = parts[10] if len(parts) > 10 else ''
 
                                 chats[chat_id] = {
-                                    'title': chat_title,
+                                    'title': clean_text(chat_title),
                                     'type': chat_type,
                                     'access_type': access_type,
                                     'can_comment': can_comment,
@@ -246,7 +352,7 @@ class CommentsManager:
         try:
             with open(COMMENTS_FILE, 'w', encoding='utf-8') as f:
                 for chat_id, data in chats.items():
-                    title = data['title']
+                    title = encode_text_for_saving(clean_text(data['title']))
                     chat_type = data['type']
                     access_type = data['access_type']
                     can_comment = str(data['can_comment'])
@@ -335,6 +441,7 @@ class SendCodeThread(QThread):
     def __init__(self, phone):
         super().__init__()
         self.phone = phone
+        self.session_file = f"{SESSION_FILE}_{phone.replace('+', '')}"
 
     def run(self):
         loop = None
@@ -346,7 +453,7 @@ class SendCodeThread(QThread):
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
 
-                client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
+                client = TelegramClient(self.session_file, API_ID, API_HASH)
                 result = loop.run_until_complete(self.send_code(client))
                 self.finished.emit(True, result[0], result[1])
                 break
@@ -392,6 +499,7 @@ class SignInThread(QThread):
         self.code = code
         self.phone_code_hash = phone_code_hash
         self.password = password
+        self.session_file = f"{SESSION_FILE}_{phone.replace('+', '')}"
 
     def run(self):
         loop = None
@@ -399,14 +507,19 @@ class SignInThread(QThread):
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
 
-            client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
+            client = TelegramClient(self.session_file, API_ID, API_HASH)
             result = loop.run_until_complete(self.sign_in(client))
             self.finished.emit(True, result)
 
         except SessionPasswordNeededError:
+            # Обработка необходимости пароля
             self.need_password.emit()
         except Exception as e:
-            self.error.emit(str(e))
+            error_msg = str(e)
+            if 'two-step verification' in error_msg.lower() or 'two factor' in error_msg.lower():
+                self.need_password.emit()
+            else:
+                self.error.emit(error_msg)
         finally:
             if loop and not loop.is_closed():
                 loop.close()
@@ -417,11 +530,23 @@ class SignInThread(QThread):
             await client.connect()
 
         try:
-            await client.sign_in(
-                phone=self.phone,
-                code=self.code,
-                phone_code_hash=self.phone_code_hash
-            )
+            if self.password is None:
+                # Без пароля
+                await client.sign_in(
+                    phone=self.phone,
+                    code=self.code,
+                    phone_code_hash=self.phone_code_hash
+                )
+            else:
+                # С паролем - сначала код, потом пароль
+                await client.sign_in(
+                    phone=self.phone,
+                    code=self.code,
+                    phone_code_hash=self.phone_code_hash
+                )
+
+                # Если требуется пароль, Telethon сам выбросит SessionPasswordNeededError
+                # и мы попадем в нужный обработчик
 
             if await client.is_user_authorized():
                 await client.disconnect()
@@ -431,17 +556,233 @@ class SignInThread(QThread):
                 return "Ошибка авторизации"
 
         except SessionPasswordNeededError:
+            # Если требуется пароль, вводим его
             if self.password:
                 await client.sign_in(password=self.password)
                 if await client.is_user_authorized():
                     await client.disconnect()
-                    return "Авторизация с 2FA успешна!"
+                    return "Авторизация успешна (с паролем 2FA)!"
                 else:
                     await client.disconnect()
-                    return "Ошибка авторизации с паролем"
+                    raise Exception("Неверный пароль 2FA")
             else:
-                await client.disconnect()
-                raise SessionPasswordNeededError()
+                # Если пароль не был передан, пробрасываем исключение выше
+                raise
+        except Exception as e:
+            await client.disconnect()
+            raise e
+
+
+class AuthDialog(QDialog):
+    authorization_success = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.phone_code_hash = None
+        self.phone = None
+        self.password_entered = False
+        self.init_ui()
+
+    def init_ui(self):
+        self.setWindowTitle('Авторизация в Telegram')
+        self.setFixedSize(400, 450)
+        layout = QVBoxLayout()
+
+        self.stacked_widget = QWidget()
+        self.stacked_layout = QVBoxLayout()
+
+        # Шаг 1: Ввод телефона
+        self.phone_widget = QWidget()
+        phone_layout = QVBoxLayout()
+        phone_layout.addWidget(QLabel('Введите номер телефона (с кодом страны):'))
+
+        self.phone_edit = QLineEdit()
+        self.phone_edit.setPlaceholderText('+79991234567')
+        phone_layout.addWidget(self.phone_edit)
+
+        self.send_code_btn = QPushButton('Отправить код')
+        self.send_code_btn.setStyleSheet('background-color: #2196F3; color: white; font-weight: bold; padding: 10px;')
+        self.send_code_btn.clicked.connect(self.send_code)
+        phone_layout.addWidget(self.send_code_btn)
+
+        phone_layout.addStretch()
+        self.phone_widget.setLayout(phone_layout)
+
+        # Шаг 2: Ввод кода
+        self.code_widget = QWidget()
+        code_layout = QVBoxLayout()
+        code_layout.addWidget(QLabel('Введите код из Telegram:'))
+
+        self.code_edit = QLineEdit()
+        self.code_edit.setPlaceholderText('12345')
+        code_layout.addWidget(self.code_edit)
+
+        self.verify_code_btn = QPushButton('Подтвердить')
+        self.verify_code_btn.setStyleSheet('background-color: #4CAF50; color: white; font-weight: bold; padding: 10px;')
+        self.verify_code_btn.clicked.connect(self.verify_code)
+        code_layout.addWidget(self.verify_code_btn)
+
+        code_layout.addStretch()
+        self.code_widget.setLayout(code_layout)
+
+        # Шаг 3: Ввод пароля 2FA
+        self.password_widget = QWidget()
+        password_layout = QVBoxLayout()
+        password_layout.addWidget(QLabel('Введите пароль двухэтапной аутентификации:'))
+
+        self.password_edit = QLineEdit()
+        self.password_edit.setPlaceholderText('Пароль 2FA')
+        self.password_edit.setEchoMode(QLineEdit.Password)
+        password_layout.addWidget(self.password_edit)
+
+        self.verify_password_btn = QPushButton('Подтвердить пароль')
+        self.verify_password_btn.setStyleSheet(
+            'background-color: #FF9800; color: white; font-weight: bold; padding: 10px;')
+        self.verify_password_btn.clicked.connect(self.verify_password)
+        password_layout.addWidget(self.verify_password_btn)
+
+        password_layout.addStretch()
+        self.password_widget.setLayout(password_layout)
+
+        # Добавляем все виджеты
+        self.stacked_layout.addWidget(self.phone_widget)
+        self.stacked_layout.addWidget(self.code_widget)
+        self.stacked_layout.addWidget(self.password_widget)
+        self.stacked_widget.setLayout(self.stacked_layout)
+        layout.addWidget(self.stacked_widget)
+
+        # Статус
+        self.status_label = QLabel('')
+        self.status_label.setStyleSheet('color: gray; font-size: 11px;')
+        layout.addWidget(self.status_label)
+
+        self.setLayout(layout)
+        self.show_phone_step()
+
+    def show_phone_step(self):
+        self.code_widget.setVisible(False)
+        self.password_widget.setVisible(False)
+        self.phone_widget.setVisible(True)
+        self.status_label.setText('Введите номер телефона')
+        self.password_entered = False
+
+    def show_code_step(self, phone):
+        self.phone_widget.setVisible(False)
+        self.password_widget.setVisible(False)
+        self.code_widget.setVisible(True)
+        self.phone = phone
+        self.status_label.setText(f'Код отправлен на {phone}. Введите код из Telegram.')
+        self.password_entered = False
+
+    def show_password_step(self):
+        self.phone_widget.setVisible(False)
+        self.code_widget.setVisible(False)
+        self.password_widget.setVisible(True)
+        self.status_label.setText('Требуется двухэтапная аутентификация. Введите пароль:')
+        self.password_edit.setFocus()
+        self.password_entered = False
+
+    def send_code(self):
+        phone = self.phone_edit.text().strip()
+        if not phone:
+            QMessageBox.warning(self, 'Ошибка', 'Введите номер телефона')
+            return
+
+        self.send_code_btn.setEnabled(False)
+        self.send_code_btn.setText('Отправка...')
+
+        self.send_code_thread = SendCodeThread(phone)
+        self.send_code_thread.finished.connect(self.on_code_sent)
+        self.send_code_thread.error.connect(self.on_send_code_error)
+        self.send_code_thread.start()
+
+    def on_code_sent(self, success, message, phone_code_hash):
+        self.send_code_btn.setEnabled(True)
+        self.send_code_btn.setText('Отправить код')
+
+        if success:
+            self.phone_code_hash = phone_code_hash
+            self.show_code_step(self.phone_edit.text().strip())
+            self.status_label.setText(message)
+        else:
+            QMessageBox.warning(self, 'Ошибка', message)
+
+    def on_send_code_error(self, error_message):
+        self.send_code_btn.setEnabled(True)
+        self.send_code_btn.setText('Отправить код')
+        QMessageBox.critical(self, 'Ошибка', f'Ошибка отправки кода: {error_message}')
+
+    def verify_code(self):
+        code = self.code_edit.text().strip()
+        if not code:
+            QMessageBox.warning(self, 'Ошибка', 'Введите код')
+            return
+
+        self.verify_code_btn.setEnabled(False)
+        self.verify_code_btn.setText('Проверка...')
+
+        self.sign_in_thread = SignInThread(
+            self.phone,
+            code,
+            self.phone_code_hash
+        )
+        self.sign_in_thread.finished.connect(self.on_sign_in_finished)
+        self.sign_in_thread.need_password.connect(self.on_need_password)
+        self.sign_in_thread.error.connect(self.on_sign_in_error)
+        self.sign_in_thread.start()
+
+    def verify_password(self):
+        password = self.password_edit.text().strip()
+        if not password:
+            QMessageBox.warning(self, 'Ошибка', 'Введите пароль 2FA')
+            return
+
+        self.verify_password_btn.setEnabled(False)
+        self.verify_password_btn.setText('Проверка...')
+
+        # Повторная попытка авторизации с паролем
+        self.sign_in_thread = SignInThread(
+            self.phone,
+            self.code_edit.text().strip(),
+            self.phone_code_hash,
+            password
+        )
+        self.sign_in_thread.finished.connect(self.on_sign_in_finished)
+        self.sign_in_thread.error.connect(self.on_sign_in_error)
+        self.sign_in_thread.start()
+        self.password_entered = True
+
+    def on_sign_in_finished(self, success, message):
+        if success:
+            self.authorization_success.emit()
+            self.accept()
+            QMessageBox.information(self, 'Успех', message)
+        else:
+            if not self.password_entered:
+                self.verify_code_btn.setEnabled(True)
+                self.verify_code_btn.setText('Подтвердить')
+            self.verify_password_btn.setEnabled(True)
+            self.verify_password_btn.setText('Подтвердить пароль')
+            QMessageBox.warning(self, 'Ошибка', message)
+
+    def on_need_password(self):
+        self.verify_code_btn.setEnabled(True)
+        self.verify_code_btn.setText('Подтвердить')
+        self.show_password_step()
+
+    def on_sign_in_error(self, error_message):
+        if not self.password_entered:
+            self.verify_code_btn.setEnabled(True)
+            self.verify_code_btn.setText('Подтвердить')
+        self.verify_password_btn.setEnabled(True)
+        self.verify_password_btn.setText('Подтвердить пароль')
+
+        if 'PASSWORD_HASH_INVALID' in error_message:
+            QMessageBox.warning(self, 'Ошибка', 'Неверный пароль 2FA. Попробуйте снова.')
+            self.password_edit.clear()
+            self.password_edit.setFocus()
+        else:
+            QMessageBox.critical(self, 'Ошибка авторизации', error_message)
 
 
 class CompactChatWidget(QWidget):
@@ -585,10 +926,12 @@ class LoadFolderThread(QThread):
     progress = pyqtSignal(str)
     error = pyqtSignal(str)
 
-    def __init__(self, folder_name):
+    def __init__(self, folder_name, phone=None):
         super().__init__()
         self.folder_name = folder_name
         self.client = None
+        self.phone = phone
+        self.session_file = f"{SESSION_FILE}_{phone.replace('+', '')}" if phone else SESSION_FILE
 
     def run(self):
         loop = None
@@ -596,7 +939,7 @@ class LoadFolderThread(QThread):
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
 
-            self.client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
+            self.client = TelegramClient(self.session_file, API_ID, API_HASH)
             result = loop.run_until_complete(self.load_folder_chats())
             self.finished.emit(result)
 
@@ -626,24 +969,57 @@ class LoadFolderThread(QThread):
 
             folder_chat_ids = folders[self.folder_name]
 
-            # Получаем все диалоги для поиска чатов по ID
-            dialogs = await self.client.get_dialogs()
+            if not folder_chat_ids:
+                await self.client.disconnect()
+                self.progress.emit(f"⚠️ Папка '{self.folder_name}' пустая")
+                return found_chats
 
+            # Получаем все диалоги для быстрого поиска
+            dialogs = await self.client.get_dialogs(limit=200)
+
+            # Создаем словарь для быстрого поиска диалогов по ID
+            dialogs_by_id = {}
             for dialog in dialogs:
                 if hasattr(dialog, 'entity') and hasattr(dialog.entity, 'id'):
                     chat_id = str(dialog.entity.id)
+                    dialogs_by_id[chat_id] = dialog
 
-                    if chat_id in folder_chat_ids:
-                        # Обрабатываем чат без тестовых сообщений
-                        if await self.process_folder_entity(dialog.entity, found_chats, dialog.name):
-                            self.progress.emit(f"✅ Загружен: {dialog.name}")
+            # Обрабатываем каждый чат из папки
+            processed = 0
+            for chat_id in folder_chat_ids:
+                try:
+                    # Пробуем найти в уже загруженных диалогах
+                    if chat_id in dialogs_by_id:
+                        dialog = dialogs_by_id[chat_id]
+                        entity = dialog.entity
+                        dialog_name = dialog.name
+                    else:
+                        # Пробуем получить чат напрямую по ID
+                        try:
+                            entity = await self.client.get_entity(int(chat_id))
+                            dialog_name = getattr(entity, 'title', '')
+                        except Exception as e:
+                            self.progress.emit(f"⚠️ Не удалось получить чат ID {chat_id}: {str(e)}")
+                            continue
+
+                    # Обрабатываем чат
+                    if await self.process_folder_entity(entity, found_chats, dialog_name):
+                        processed += 1
+                        chat_title = getattr(entity, 'title', f'Чат {chat_id}')
+                        self.progress.emit(f"✅ Загружен: {chat_title} ({processed}/{len(folder_chat_ids)})")
+                    else:
+                        self.progress.emit(f"⚠️ Пропущен чат ID {chat_id}")
+
+                except Exception as e:
+                    self.progress.emit(f"⚠️ Ошибка обработки чата ID {chat_id}: {str(e)}")
+                    continue
 
             await self.client.disconnect()
 
             if not found_chats:
                 self.progress.emit("❌ В папке не найдено доступных чатов")
             else:
-                self.progress.emit(f"🎯 Загрузка завершена. Найдено: {len(found_chats)}")
+                self.progress.emit(f"🎯 Загрузка завершена. Найдено: {len(found_chats)} из {len(folder_chat_ids)}")
 
             return found_chats
 
@@ -679,18 +1055,36 @@ class LoadFolderThread(QThread):
 
             chat_title = getattr(entity, 'title', dialog_name)
             if not chat_title:
-                return False
+                chat_title = f"Чат {chat_id}"
+
+            # Очищаем название чата
+            chat_title = clean_text(chat_title)
 
             username = getattr(entity, 'username', '')
             access_type = "Открытый" if username else "Закрытый"
 
-            # Без проверки возможности комментирования - просто добавляем чат
+            # Проверяем, можем ли мы писать в чат
+            can_comment = True  # Предполагаем что можно
+            can_video = True  # Предполагаем что можно
+
+            # Для каналов проверяем, есть ли комментарии
+            if isinstance(entity, Channel) and entity.broadcast:
+                try:
+                    # Пробуем получить информацию о канале
+                    full_channel = await self.client(GetFullChannelRequest(entity))
+                    if hasattr(full_channel, 'linked_chat_id'):
+                        # Есть чат для комментариев
+                        can_comment = True
+                except:
+                    can_comment = False
+
+            # Сохраняем чат
             found_chats[chat_id] = {
                 'title': chat_title,
                 'type': chat_type,
                 'access_type': access_type,
-                'can_comment': True,  # Предполагаем что можно комментировать
-                'can_video': True,  # Предполагаем что можно видео
+                'can_comment': can_comment,
+                'can_video': can_video,
                 'last_post_id': '0',
                 'last_post_date': '',
                 'status': 'не отправлено',
@@ -709,11 +1103,13 @@ class CommentsSearchThread(QThread):
     progress = pyqtSignal(str)
     error = pyqtSignal(str)
 
-    def __init__(self, search_query, limit=50):
+    def __init__(self, search_query, limit=50, phone=None):
         super().__init__()
         self.search_query = search_query
         self.limit = limit
         self.client = None
+        self.phone = phone
+        self.session_file = f"{SESSION_FILE}_{phone.replace('+', '')}" if phone else SESSION_FILE
 
     def run(self):
         loop = None
@@ -721,7 +1117,7 @@ class CommentsSearchThread(QThread):
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
 
-            self.client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
+            self.client = TelegramClient(self.session_file, API_ID, API_HASH)
             result = loop.run_until_complete(self.search_groups_channels())
             self.finished.emit(result)
 
@@ -861,6 +1257,9 @@ class CommentsSearchThread(QThread):
             if not chat_title:
                 return False
 
+            # Очищаем название чата
+            chat_title = clean_text(chat_title)
+
             # Фильтрация по поисковому запросу (если есть)
             if self.search_query and self.search_query.lower() not in chat_title.lower():
                 return False
@@ -904,7 +1303,8 @@ class SendCommentThread(QThread):
     finished = pyqtSignal(bool, str)
     error = pyqtSignal(str)
 
-    def __init__(self, chat_id, message, video_path=None, delay=2, delete_after_send=True, force_text_only=False):
+    def __init__(self, chat_id, message, video_path=None, delay=2, delete_after_send=True, force_text_only=False,
+                 phone=None):
         super().__init__()
         self.chat_id = chat_id
         self.message = message
@@ -912,6 +1312,8 @@ class SendCommentThread(QThread):
         self.delay = delay
         self.delete_after_send = delete_after_send
         self.force_text_only = force_text_only
+        self.phone = phone
+        self.session_file = f"{SESSION_FILE}_{phone.replace('+', '')}" if phone else SESSION_FILE
 
     def run(self):
         loop = None
@@ -919,7 +1321,7 @@ class SendCommentThread(QThread):
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
 
-            client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
+            client = TelegramClient(self.session_file, API_ID, API_HASH)
             result = loop.run_until_complete(self.send_comment(client))
             self.finished.emit(True, result)
 
@@ -961,23 +1363,34 @@ class SendCommentThread(QThread):
 
             sent_message = None
 
+            # Очищаем сообщение перед отправкой
+            clean_message = clean_text(self.message) if self.message else ""
+
             # Пробуем отправить видео, если есть
             if self.video_path and os.path.exists(self.video_path) and not self.force_text_only:
                 try:
-                    if self.message.strip():
+                    if clean_message.strip():
                         sent_message = await client.send_file(entity, self.video_path,
-                                                              caption=self.message,
+                                                              caption=clean_message,
                                                               reply_to=last_message.id)
                     else:
                         sent_message = await client.send_file(entity, self.video_path,
                                                               reply_to=last_message.id)
                 except Exception:
                     # Если не получилось отправить видео, отправляем текст
-                    sent_message = await client.send_message(entity, self.message,
-                                                             reply_to=last_message.id)
+                    if clean_message.strip():
+                        sent_message = await client.send_message(entity, clean_message,
+                                                                 reply_to=last_message.id)
+                    else:
+                        await client.disconnect()
+                        raise Exception("Сообщение пустое")
             else:
-                sent_message = await client.send_message(entity, self.message,
-                                                         reply_to=last_message.id)
+                if clean_message.strip():
+                    sent_message = await client.send_message(entity, clean_message,
+                                                             reply_to=last_message.id)
+                else:
+                    await client.disconnect()
+                    raise Exception("Сообщение пустое")
 
             # Удаление тестовых сообщений
             if self.delete_after_send and sent_message:
@@ -1017,7 +1430,7 @@ class AutoCommentsThread(QThread):
     finished = pyqtSignal(str)
     error = pyqtSignal(str)
 
-    def __init__(self, message, video_path, selected_chats, min_delay=3600, max_delay=5400, daily_limit=10):
+    def __init__(self, message, video_path, selected_chats, min_delay=3600, max_delay=5400, daily_limit=10, phone=None):
         super().__init__()
         self.message = message
         self.video_path = video_path
@@ -1025,6 +1438,8 @@ class AutoCommentsThread(QThread):
         self.min_delay = min_delay
         self.max_delay = max_delay
         self.daily_limit = daily_limit
+        self.phone = phone
+        self.session_file = f"{SESSION_FILE}_{phone.replace('+', '')}" if phone else SESSION_FILE
         self.is_running = True
 
     def stop_sending(self):
@@ -1036,7 +1451,7 @@ class AutoCommentsThread(QThread):
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
 
-            client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
+            client = TelegramClient(self.session_file, API_ID, API_HASH)
             result = loop.run_until_complete(self.send_comments_loop(client))
             self.finished.emit(result)
 
@@ -1105,12 +1520,15 @@ class AutoCommentsThread(QThread):
 
                     sent_message = None
 
+                    # Очищаем сообщение
+                    clean_message = clean_text(self.message) if self.message else ""
+
                     # Пробуем отправить видео, если есть
                     if self.video_path and os.path.exists(self.video_path):
                         try:
-                            if self.message.strip():
+                            if clean_message.strip():
                                 sent_message = await client.send_file(entity, self.video_path,
-                                                                      caption=self.message,
+                                                                      caption=clean_message,
                                                                       reply_to=last_message.id)
                                 media_type = "видео+текст"
                             else:
@@ -1119,13 +1537,25 @@ class AutoCommentsThread(QThread):
                                 media_type = "видео"
                         except Exception:
                             # Если не получилось отправить видео, отправляем текст
-                            sent_message = await client.send_message(entity, self.message,
+                            if clean_message.strip():
+                                sent_message = await client.send_message(entity, clean_message,
+                                                                         reply_to=last_message.id)
+                                media_type = "текст"
+                            else:
+                                self.progress.emit(f"⚠️ Пропускаем {chat_title}: сообщение пустое",
+                                                   sent_count, failed_count)
+                                failed_count += 1
+                                continue
+                    else:
+                        if clean_message.strip():
+                            sent_message = await client.send_message(entity, clean_message,
                                                                      reply_to=last_message.id)
                             media_type = "текст"
-                    else:
-                        sent_message = await client.send_message(entity, self.message,
-                                                                 reply_to=last_message.id)
-                        media_type = "текст"
+                        else:
+                            self.progress.emit(f"⚠️ Пропускаем {chat_title}: сообщение пустое",
+                                               sent_count, failed_count)
+                            failed_count += 1
+                            continue
 
                     send_time = datetime.now().strftime('%d.%m.%Y %H:%M:%S')
                     CommentsManager.update_chat_status(chat_id, 'отправлено', send_time)
@@ -1181,6 +1611,7 @@ class CommentsSenderApp(QMainWindow):
         self.auto_thread = None
         self.selected_chats_for_sending = set()
         self.found_chats = {}
+        self.current_phone = None
         self.init_ui()
         self.load_chats()
         self.check_auth()
@@ -1314,7 +1745,23 @@ class CommentsSenderApp(QMainWindow):
 
         self.message_text = QTextEdit()
         self.message_text.setMinimumHeight(120)
-        self.message_text.setPlaceholderText('Введите текст комментария...')
+        self.message_text.setPlaceholderText('Введите текст комментария...\nМожно использовать смайлы/эмодзи: 😊 👍 🚀')
+
+        # Добавляем кнопки быстрой вставки смайлов
+        emoji_layout = QHBoxLayout()
+        emoji_layout.addWidget(QLabel('Быстрые смайлы:'))
+
+        popular_emojis = ['😊', '👍', '❤️', '🔥', '🚀', '💯', '⭐', '🎯', '🤝', '🙏']
+
+        for emoji in popular_emojis:
+            emoji_btn = QPushButton(emoji)
+            emoji_btn.setStyleSheet('font-size: 16px; padding: 2px 5px;')
+            emoji_btn.clicked.connect(lambda checked, e=emoji: self.insert_emoji(e))
+            emoji_layout.addWidget(emoji_btn)
+
+        emoji_layout.addStretch()
+        message_layout.addLayout(emoji_layout)
+
         message_layout.addWidget(self.message_text)
 
         video_layout = QHBoxLayout()
@@ -1404,6 +1851,12 @@ class CommentsSenderApp(QMainWindow):
 
         self.update_stats()
 
+    def insert_emoji(self, emoji):
+        """Вставляет смайл в текстовое поле"""
+        cursor = self.message_text.textCursor()
+        cursor.insertText(emoji)
+        self.message_text.setFocus()
+
     def refresh_folders(self):
         """Обновляет список папок из Telegram"""
         if not self.check_auth():
@@ -1413,7 +1866,7 @@ class CommentsSenderApp(QMainWindow):
         self.refresh_folders_btn.setEnabled(False)
         self.refresh_folders_btn.setText('...')
 
-        self.load_folders_thread = LoadFoldersThread()
+        self.load_folders_thread = LoadFoldersThread(self.current_phone)
         self.load_folders_thread.finished.connect(self.on_folders_loaded)
         self.load_folders_thread.progress.connect(self.on_folders_progress)
         self.load_folders_thread.error.connect(self.on_folders_error)
@@ -1460,7 +1913,7 @@ class CommentsSenderApp(QMainWindow):
         self.load_folder_btn.setEnabled(False)
         self.load_folder_btn.setText('...')
 
-        self.load_folder_thread = LoadFolderThread(folder_name)
+        self.load_folder_thread = LoadFolderThread(folder_name, self.current_phone)
         self.load_folder_thread.finished.connect(self.on_folder_load_finished)
         self.load_folder_thread.progress.connect(self.on_folder_load_progress)
         self.load_folder_thread.error.connect(self.on_folder_load_error)
@@ -1498,47 +1951,57 @@ class CommentsSenderApp(QMainWindow):
         QMessageBox.critical(self, 'Ошибка загрузки папки', error_message)
 
     def check_auth(self):
-        """Проверяет авторизацию используя тот же файл сессии"""
-        loop = None
-        try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+        """Проверяет авторизацию для всех возможных сессий"""
+        import glob
+        session_files = glob.glob(f"{SESSION_FILE}_*")
 
-            client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
+        is_authorized = False
 
-            async def check_auth_internal():
-                try:
-                    await client.connect()
-                    if not client.is_connected():
-                        return False
-                    return await client.is_user_authorized()
-                except Exception:
-                    return False
-                finally:
+        for session_file in session_files:
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+
+                client = TelegramClient(session_file, API_ID, API_HASH)
+
+                async def check_auth_internal():
                     try:
-                        await client.disconnect()
-                    except:
-                        pass
+                        await client.connect()
+                        if not client.is_connected():
+                            return False
+                        auth_status = await client.is_user_authorized()
+                        if auth_status:
+                            # Извлекаем номер из имени файла
+                            phone_part = session_file.split('_')[-1]
+                            self.current_phone = f"+{phone_part}"
+                        return auth_status
+                    except Exception:
+                        return False
+                    finally:
+                        try:
+                            await client.disconnect()
+                        except:
+                            pass
 
-            is_authorized = loop.run_until_complete(check_auth_internal())
+                is_authorized = loop.run_until_complete(check_auth_internal())
+                if is_authorized:
+                    break
 
-            if is_authorized:
-                self.auth_btn.setText('✅ Авторизован')
-                self.auth_btn.setStyleSheet('background-color: #4CAF50; color: white; font-weight: bold; padding: 8px;')
-                return True
-            else:
-                self.auth_btn.setText('🔐 Авторизация')
-                self.auth_btn.setStyleSheet('background-color: #FF9800; color: white; font-weight: bold; padding: 8px;')
-                return False
+            except Exception:
+                continue
+            finally:
+                if loop and not loop.is_closed():
+                    loop.close()
 
-        except Exception as e:
-            print(f"Ошибка проверки авторизации: {e}")
+        if is_authorized:
+            self.auth_btn.setText(f'✅ Авторизован ({self.current_phone})')
+            self.auth_btn.setStyleSheet('background-color: #4CAF50; color: white; font-weight: bold; padding: 8px;')
+        else:
             self.auth_btn.setText('🔐 Авторизация')
             self.auth_btn.setStyleSheet('background-color: #FF9800; color: white; font-weight: bold; padding: 8px;')
-            return False
-        finally:
-            if loop and not loop.is_closed():
-                loop.close()
+            self.current_phone = None
+
+        return is_authorized
 
     def auth_button_clicked(self):
         """Обработчик нажатия кнопки авторизации"""
@@ -1553,8 +2016,16 @@ class CommentsSenderApp(QMainWindow):
     def logout(self):
         """Выход из системы"""
         try:
-            if os.path.exists(SESSION_FILE):
-                os.remove(SESSION_FILE)
+            # Удаляем все сессионные файлы
+            import glob
+            session_files = glob.glob(f"{SESSION_FILE}_*")
+            for session_file in session_files:
+                try:
+                    os.remove(session_file)
+                except:
+                    pass
+
+            self.current_phone = None
             self.auth_btn.setText('🔐 Авторизация')
             self.auth_btn.setStyleSheet('background-color: #FF9800; color: white; font-weight: bold; padding: 8px;')
             QMessageBox.information(self, 'Выход', 'Вы успешно вышли из системы')
@@ -1655,7 +2126,7 @@ class CommentsSenderApp(QMainWindow):
         self.search_btn.setEnabled(False)
         self.search_btn.setText('...')
 
-        self.search_thread = CommentsSearchThread(search_query, 30)
+        self.search_thread = CommentsSearchThread(search_query, 30, self.current_phone)
         self.search_thread.finished.connect(self.on_search_finished)
         self.search_thread.progress.connect(self.on_search_progress)
         self.search_thread.error.connect(self.on_search_error)
@@ -1801,7 +2272,8 @@ class CommentsSenderApp(QMainWindow):
         self.statusBar().showMessage(f'🧪 Тестовый комментарий в {chat_title}...')
 
         # Для тестового комментария устанавливаем delete_after_send=True
-        self.send_thread = SendCommentThread(chat_id, message, video_path, delete_after_send=True)
+        self.send_thread = SendCommentThread(chat_id, message, video_path, delete_after_send=True,
+                                             phone=self.current_phone)
         self.send_thread.finished.connect(self.on_test_send_finished)
         self.send_thread.error.connect(self.on_test_send_error)
         self.send_thread.start()
@@ -1879,7 +2351,8 @@ class CommentsSenderApp(QMainWindow):
 
         video_path = getattr(self, 'video_path', None)
         # Для обычной рассылки delete_after_send=False (сообщения остаются)
-        self.send_thread = SendCommentThread(chat_id, message, video_path, delete_after_send=False)
+        self.send_thread = SendCommentThread(chat_id, message, video_path, delete_after_send=False,
+                                             phone=self.current_phone)
         self.send_thread.finished.connect(
             lambda success, result: self.on_single_send_finished(success, result, chat_ids, message, current_index)
         )
@@ -1931,7 +2404,8 @@ class CommentsSenderApp(QMainWindow):
             list(self.selected_chats_for_sending),
             self.settings['min_delay'],
             self.settings['max_delay'],
-            self.settings['daily_limit']
+            self.settings['daily_limit'],
+            self.current_phone
         )
         self.auto_thread.progress.connect(self.on_auto_send_progress)
         self.auto_thread.finished.connect(self.on_auto_send_finished)
